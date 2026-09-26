@@ -19,6 +19,7 @@ pub mod hand_model;
 pub mod loss;
 
 pub mod gpu_utils;
+pub mod gpu_vit;
 #[cfg(feature = "log")]
 pub mod log;
 

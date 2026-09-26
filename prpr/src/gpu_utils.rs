@@ -185,7 +185,6 @@ impl GpuNetworkExecutor {
             ],
             label: Some("Common Bind Group Layout"),
         });
-        )
         let lstm_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -506,7 +505,7 @@ impl GpuNetworkExecutor {
 
 
     pub fn ensure_capacity(&self, required_elements: usize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if required_elements <= state.buffer_capacity {
             return;
         }
@@ -520,7 +519,6 @@ impl GpuNetworkExecutor {
         new_capacity: usize,
     ) {
         let new_size = Self::data_buffer_byte_size(new_capacity);
-        let old = state.buffer_capacity;
 
         state.buffer_a = Self::make_data_buffer(device, "Ping-Pong Buffer A", new_size, true);
         state.buffer_b = Self::make_data_buffer(device, "Ping-Pong Buffer B", new_size, true);
@@ -534,12 +532,10 @@ impl GpuNetworkExecutor {
         state.cached_bind_groups = None;
         state.weights_uploaded = false;
         state.buffer_capacity = new_capacity;
-        println!("[GPU] Grew data buffers: {} -> {} f32 elements ({} bytes each)",
-                 old, new_capacity, new_size);
     }
 
     pub fn initialize_network(&self, layers: &[NetworkLayerGPU]) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
         let required = Self::required_capacity_for_layers(layers, 0);
         if required > state.buffer_capacity {
@@ -600,7 +596,7 @@ impl GpuNetworkExecutor {
     }
 
     pub fn execute_network_forward(&self, input_data: &[f32], layers: &[NetworkLayerGPU], output_size: usize) -> Vec<f32> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
         let required = Self::required_capacity_for_layers(layers, input_data.len())
             .max(output_size);

@@ -3,6 +3,29 @@ use macroquad::{
     window::get_internal_gl,
     miniquad::{gl::GLuint, RenderPass, Texture, TextureFormat},
 };
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// Bumped once at the start of every chart update cycle. `read_pixels_resized`
+/// memoizes its result within a cycle, so a single full-frame GPU readback is
+/// shared by *all* judge lines instead of performing one per line per request.
+static READBACK_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+pub fn begin_readback_cycle() {
+    READBACK_CYCLE.fetch_add(1, Ordering::Relaxed);
+}
+
+struct ReadbackState {
+    /// (readback cycle, fbo id, result length, rgb data in 0..=1)
+    cache: Option<(u64, GLuint, usize, Vec<f32>)>,
+    /// ~6 MB staging buffer, reused across readbacks
+    staging: Vec<u8>,
+}
+
+static READBACK_STATE: Lazy<Mutex<ReadbackState>> = Lazy::new(|| {
+    Mutex::new(ReadbackState { cache: None, staging: Vec::new() })
+});
 
 pub struct MSRenderTarget {
     dim: (u32, u32),
@@ -103,6 +126,56 @@ impl MSRenderTarget {
 
     pub fn old(&self) -> RenderTarget {
         self.output[1]
+    }
+
+    /// Frame readback for the AI. Memoized per readback cycle (see
+    /// `begin_readback_cycle`): the chart is read at most once per update no
+    /// matter how many judge lines ask for it.
+    pub fn read_pixels_resized(&self, target_w: usize, target_h: usize) -> Vec<f32> {
+        let cycle = READBACK_CYCLE.load(Ordering::Relaxed);
+        let fbo = internal_id(&self.output[0]);
+        let len = target_w * target_h * 3;
+
+        let mut state = READBACK_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_cycle, cached_fbo, cached_len, data)) = state.cache.as_ref() {
+            if *cached_cycle == cycle && *cached_fbo == fbo && *cached_len == len {
+                return data.clone();
+            }
+        }
+        let fresh = self.read_pixels_resized_uncached(&mut state.staging, target_w, target_h);
+        state.cache = Some((cycle, fbo, len, fresh.clone()));
+        fresh
+    }
+
+    fn read_pixels_resized_uncached(&self, staging: &mut Vec<u8>, target_w: usize, target_h: usize) -> Vec<f32> {
+        let (src_w, src_h) = self.dim;
+        let total_pixels = (src_w * src_h * 3) as usize;
+        let fbo = internal_id(&self.output[0]);
+
+        // Keep the ~6 MB staging buffer alive across calls instead of
+        // allocating a fresh one for every readback.
+        staging.clear();
+        staging.resize(total_pixels, 0);
+
+        unsafe {
+            use macroquad::miniquad::gl::*;
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+            glReadPixels(0, 0, src_w as i32, src_h as i32, GL_RGB, GL_UNSIGNED_BYTE, staging.as_mut_ptr() as *mut _);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        }
+
+        let mut result = Vec::with_capacity(target_w * target_h * 3);
+        for ty in 0..target_h {
+            for tx in 0..target_w {
+                let sx = ((tx * src_w as usize) / target_w).min(src_w as usize - 1);
+                let sy = ((ty * src_h as usize) / target_h).min(src_h as usize - 1);
+                let src_idx = (sy * src_w as usize + sx) * 3;
+                result.push(staging[src_idx] as f32 / 255.0);
+                result.push(staging[src_idx + 1] as f32 / 255.0);
+                result.push(staging[src_idx + 2] as f32 / 255.0);
+            }
+        }
+        result
     }
 }
 
