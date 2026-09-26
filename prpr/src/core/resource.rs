@@ -13,7 +13,13 @@ use sasa::{AudioClip, AudioManager, Sfx};
 use serde::Deserialize;
 use std::{cell::RefCell, collections::BTreeMap, ops::DerefMut, path::Path, sync::atomic::AtomicU32};
 
-pub const MAX_SIZE: usize = 64; // needs tweaking
+/// Quads per `NoteBuffer` mesh chunk. Kept small so a partially filled chunk
+/// still fits into (and can be merged within) a single macroquad draw call.
+pub const MAX_SIZE: usize = 64;
+/// Quads per macroquad draw call. This must stay *larger* than `MAX_SIZE`,
+/// otherwise every chunk becomes its own draw call (and therefore its own
+/// render pass restart), which is what used to happen when both were 64.
+pub const DRAWCALL_QUADS: usize = 1024;
 pub static DPI_VALUE: AtomicU32 = AtomicU32::new(250);
 
 #[inline]
@@ -517,7 +523,7 @@ impl Resource {
 
         let no_effect = config.disable_effect || has_no_effect;
 
-        macroquad::window::gl_set_drawcall_buffer_capacity(MAX_SIZE * 4, MAX_SIZE * 6);
+        macroquad::window::gl_set_drawcall_buffer_capacity(DRAWCALL_QUADS * 4, DRAWCALL_QUADS * 6);
         Ok(Self {
             config,
             chart_format,
@@ -628,6 +634,13 @@ impl Resource {
         )
     }
 
+    /// Top of prpr's own model stack (screen space = model applied to world space).
+    #[inline(always)]
+    pub fn model(&self) -> Matrix {
+        *self.model_stack.last().unwrap()
+    }
+
+    #[inline]
     pub fn world_to_screen(&self, pt: Point) -> Point {
         self.model_stack.last().unwrap().transform_point(&pt)
     }
