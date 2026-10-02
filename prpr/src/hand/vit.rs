@@ -206,7 +206,7 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &[f32], y: &mut [f32]) {
-        if x.is_empty() && x == 0 { return; }
+        if x.is_empty() { return; }
         let mean_square = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
         let inv_rms = 1.0 / (mean_square + 1e-5).sqrt();
         for ((out, input), gain) in y.iter_mut().zip(x.iter()).zip(self.gain.iter()) {
