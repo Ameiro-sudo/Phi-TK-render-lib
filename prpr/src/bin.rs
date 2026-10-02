@@ -170,10 +170,11 @@ impl BinaryData for Color {
     }
 
     fn write_binary<W: Write>(&self, w: &mut BinaryWriter<W>) -> Result<()> {
-        w.write_val((self.r * 256.) as u8)?;
-        w.write_val((self.g * 256.) as u8)?;
-        w.write_val((self.b * 256.) as u8)?;
-        w.write_val((self.a * 256.) as u8)?;
+        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        w.write_val(to_u8(self.r))?;
+        w.write_val(to_u8(self.g))?;
+        w.write_val(to_u8(self.b))?;
+        w.write_val(to_u8(self.a))?;
         Ok(())
     }
 }
