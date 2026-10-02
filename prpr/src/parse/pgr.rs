@@ -15,8 +15,6 @@ use serde::{Deserialize};
 use tracing::warn;
 use anyhow::bail;
 use crate::core::note::Hand;
-use crate::hand::assign_hands;
-use crate::config::Config;
 use std::rc::Rc;
 use std::cell::RefCell;
 use crate::core::CtrlObject;
@@ -271,7 +269,7 @@ fn parse_notes(r: f32, mut pgr: Vec<PgrNote>, speed: &mut AnimFloat, height: &mu
         .collect::<Result<Vec<_>>>()
 }
 
-fn parse_judge_line(pgr: PgrJudgeLine, max_time: f32, bpm_list: &BpmList, id: usize) -> Result<JudgeLine> {
+fn parse_judge_line(pgr: PgrJudgeLine, max_time: f32) -> Result<JudgeLine> {
     if pgr.bpm <= 0.0 {
         bail!("Invalid BPM: {}", pgr.bpm);
     }
@@ -280,10 +278,7 @@ fn parse_judge_line(pgr: PgrJudgeLine, max_time: f32, bpm_list: &BpmList, id: us
     let notes_above = parse_notes(r, pgr.notes_above, &mut speed, &mut height, true).context("Failed to parse notes above")?;
     let mut notes_below = parse_notes(r, pgr.notes_below, &mut speed, &mut height, false).context("Failed to parse notes below")?;
     let mut notes = notes_above;
-    let config = Config::default();
     notes.append(&mut notes_below);
-    let initial_rotation = pgr.rotate_events.first().map(|e| e.start).unwrap_or(0.0);
-    assign_hands(&mut notes, &config, id, initial_rotation, bpm_list);
     let cache = JudgeLineCache::new(&mut notes);
     Ok(JudgeLine {
         object: Object {
@@ -311,11 +306,9 @@ fn parse_judge_line(pgr: PgrJudgeLine, max_time: f32, bpm_list: &BpmList, id: us
 pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
     let pgr: PgrChart = serde_json::from_str(source).with_context(|| ptl!("json-parse-failed"))?;
     let mut bpm_values = Vec::new();
-    let _indices: Vec<usize> = (0..pgr.judge_line_list.len()).collect();
     for (index, judge_line) in pgr.judge_line_list.iter().enumerate() {
         bpm_values.push((index as f32, judge_line.bpm));
     }
-    let _r = BpmList::new(bpm_values.clone());
 
     let max_time = *pgr
         .judge_line_list
@@ -336,7 +329,7 @@ pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
         .judge_line_list
         .into_iter()
         .enumerate()
-        .map(|(id, pgr)| parse_judge_line(pgr, max_time, &_r, id).with_context(|| ptl!("judge-line-location", "jlid" => id)))
+        .map(|(id, pgr)| parse_judge_line(pgr, max_time).with_context(|| ptl!("judge-line-location", "jlid" => id)))
         .collect::<Result<Vec<_>>>()?;
 
     process_lines(&mut lines);

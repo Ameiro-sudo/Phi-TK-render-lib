@@ -1,91 +1,117 @@
-/*
- * gpu_vit.rs — wgpu compute executor for hand/vit.rs
- *
- * Uploads packed V weights once, runs embed / enc / qry kernels from
- * gpu_shader/vit.wgsl. CPU path in vit.rs remains the fallback.
- */
-use crate::hand::vit::{V, D, NF, NL, NP, PD};
+//! wgpu compute executor for `hand::vit`. Uploads the packed weights once and
+//! runs the `embed` / `encode` / `classify` kernels, falling back to the CPU
+//! path in `hand::vit` whenever anything is missing.
+
+use crate::hand::vit::{
+    HandVisionTransformer, BLOCK_COUNT, MODEL_DIM, NOTE_FEATURE_DIM, PATCH_COUNT, PATCH_DIM,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::util::DeviceExt;
 
-const FF: usize = 4 * D; // 256
-const QD: usize = 2 * D; // 128
+const FFN_DIM: usize = MODEL_DIM * 4;
+const FUSED_DIM: usize = MODEL_DIM * 2;
 
-/// Packed weight layout offsets — mirrors gpu_shader/vit.wgsl consts.
+/// Latched once the GPU path is rejected, so later frames stay on the CPU.
+static GPU_REJECTED: AtomicBool = AtomicBool::new(false);
+
+enum GpuPolicy {
+    Auto,
+    /// Also accept software/virtual adapters (`PRPR_VIT_GPU=force`).
+    Force,
+    Off,
+}
+
+fn gpu_policy() -> GpuPolicy {
+    match std::env::var("PRPR_VIT_GPU").ok().as_deref().map(str::trim) {
+        Some("0") | Some("off") | Some("false") | Some("no") => GpuPolicy::Off,
+        Some("1") | Some("on") | Some("true") | Some("yes") | Some("force") => GpuPolicy::Force,
+        _ => GpuPolicy::Auto,
+    }
+}
+
+/// Packed weight layout, mirrored by the constants in `gpu_shader/vit.wgsl`.
 pub mod offs {
     use super::*;
 
-    pub const OFF_PE: usize = 0;
-    pub const OFF_PEB: usize = OFF_PE + D * PD;
-    pub const OFF_POS: usize = OFF_PEB + D;
-    pub const OFF_NE: usize = OFF_POS + NP * D;
-    pub const OFF_NEB: usize = OFF_NE + D * NF;
-    pub const LAY0: usize = OFF_NEB + D;
+    pub const OFF_PATCH_WEIGHTS: usize = 0;
+    pub const OFF_PATCH_BIAS: usize = OFF_PATCH_WEIGHTS + MODEL_DIM * PATCH_DIM;
+    pub const OFF_POSITIONAL: usize = OFF_PATCH_BIAS + MODEL_DIM;
+    pub const OFF_NOTE_WEIGHTS: usize = OFF_POSITIONAL + PATCH_COUNT * MODEL_DIM;
+    pub const OFF_NOTE_BIAS: usize = OFF_NOTE_WEIGHTS + MODEL_DIM * NOTE_FEATURE_DIM;
+    pub const BLOCK_BASE: usize = OFF_NOTE_BIAS + MODEL_DIM;
 
-    pub const L0_LN0G: usize = 0;
-    pub const L0_LN0B: usize = L0_LN0G + D;
-    pub const L0_QW: usize = L0_LN0B + D;
-    pub const L0_QB: usize = L0_QW + D * D;
-    pub const L0_KW: usize = L0_QB + D;
-    pub const L0_KB: usize = L0_KW + D * D;
-    pub const L0_VW: usize = L0_KB + D;
-    pub const L0_VB: usize = L0_VW + D * D;
-    pub const L0_OW: usize = L0_VB + D;
-    pub const L0_OB: usize = L0_OW + D * D;
-    pub const L0_LN1G: usize = L0_OB + D;
-    pub const L0_LN1B: usize = L0_LN1G + D;
-    pub const L0_F0W: usize = L0_LN1B + D;
-    pub const L0_F0B: usize = L0_F0W + FF * D;
-    pub const L0_F1W: usize = L0_F0B + FF;
-    pub const L0_F1B: usize = L0_F1W + D * FF;
-    pub const LAY_SZ: usize = L0_F1B + D;
+    pub const B_ATTN_GAIN: usize = 0;
+    pub const B_QUERY_WEIGHTS: usize = B_ATTN_GAIN + MODEL_DIM;
+    pub const B_QUERY_BIAS: usize = B_QUERY_WEIGHTS + MODEL_DIM * MODEL_DIM;
+    pub const B_KEY_WEIGHTS: usize = B_QUERY_BIAS + MODEL_DIM;
+    pub const B_KEY_BIAS: usize = B_KEY_WEIGHTS + MODEL_DIM * MODEL_DIM;
+    pub const B_VALUE_WEIGHTS: usize = B_KEY_BIAS + MODEL_DIM;
+    pub const B_VALUE_BIAS: usize = B_VALUE_WEIGHTS + MODEL_DIM * MODEL_DIM;
+    pub const B_OUT_WEIGHTS: usize = B_VALUE_BIAS + MODEL_DIM;
+    pub const B_OUT_BIAS: usize = B_OUT_WEIGHTS + MODEL_DIM * MODEL_DIM;
+    pub const B_FFN_GAIN: usize = B_OUT_BIAS + MODEL_DIM;
+    pub const B_FFN_IN_WEIGHTS: usize = B_FFN_GAIN + MODEL_DIM;
+    pub const B_FFN_IN_BIAS: usize = B_FFN_IN_WEIGHTS + FFN_DIM * MODEL_DIM;
+    pub const B_FFN_OUT_WEIGHTS: usize = B_FFN_IN_BIAS + FFN_DIM;
+    pub const B_FFN_OUT_BIAS: usize = B_FFN_OUT_WEIGHTS + MODEL_DIM * FFN_DIM;
+    pub const BLOCK_SIZE: usize = B_FFN_OUT_BIAS + MODEL_DIM;
 
-    pub const OFF_FC: usize = LAY0 + NL * LAY_SZ;
-    pub const W_LEN: usize = OFF_FC + QD + 1;
+    pub const OFF_CLASSIFIER: usize = BLOCK_BASE + BLOCK_COUNT * BLOCK_SIZE;
+    pub const WEIGHT_COUNT: usize = OFF_CLASSIFIER + FUSED_DIM + 1;
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct VitP {
-    nq: u32,
+struct VitParams {
+    query_count: u32,
     layer: u32,
-    _p0: u32,
-    _p1: u32,
+    /// `1` when the encoder left its final tokens in the second ping-pong buffer.
+    final_in_second: u32,
+    _pad: u32,
 }
 
-/// Encode V linear/LN weights into one flat buffer (layout == vit.wgsl).
-pub fn pack(v: &V) -> Vec<f32> {
+pub fn pack(model: &HandVisionTransformer) -> Vec<f32> {
     use offs::*;
-    let mut b = vec![0.0f32; W_LEN];
-    b[OFF_PE..OFF_PE + D * PD].copy_from_slice(&v.pe.w);
-    b[OFF_PEB..OFF_PEB + D].copy_from_slice(&v.pe.b);
-    b[OFF_POS..OFF_POS + NP * D].copy_from_slice(&v.pos);
-    b[OFF_NE..OFF_NE + D * NF].copy_from_slice(&v.ne.w);
-    b[OFF_NEB..OFF_NEB + D].copy_from_slice(&v.ne.b);
-    for (li, blk) in v.bl.iter().enumerate() {
-        let lo = LAY0 + li * LAY_SZ;
-        b[lo + L0_LN0G..lo + L0_LN0G + D].copy_from_slice(&blk.ln0.g);
-        b[lo + L0_LN0B..lo + L0_LN0B + D].copy_from_slice(&blk.ln0.b);
-        b[lo + L0_QW..lo + L0_QW + D * D].copy_from_slice(&blk.q.w);
-        b[lo + L0_QB..lo + L0_QB + D].copy_from_slice(&blk.q.b);
-        b[lo + L0_KW..lo + L0_KW + D * D].copy_from_slice(&blk.k.w);
-        b[lo + L0_KB..lo + L0_KB + D].copy_from_slice(&blk.k.b);
-        b[lo + L0_VW..lo + L0_VW + D * D].copy_from_slice(&blk.v.w);
-        b[lo + L0_VB..lo + L0_VB + D].copy_from_slice(&blk.v.b);
-        b[lo + L0_OW..lo + L0_OW + D * D].copy_from_slice(&blk.o.w);
-        b[lo + L0_OB..lo + L0_OB + D].copy_from_slice(&blk.o.b);
-        b[lo + L0_LN1G..lo + L0_LN1G + D].copy_from_slice(&blk.ln1.g);
-        b[lo + L0_LN1B..lo + L0_LN1B + D].copy_from_slice(&blk.ln1.b);
-        b[lo + L0_F0W..lo + L0_F0W + FF * D].copy_from_slice(&blk.f0.w);
-        b[lo + L0_F0B..lo + L0_F0B + FF].copy_from_slice(&blk.f0.b);
-        b[lo + L0_F1W..lo + L0_F1W + D * FF].copy_from_slice(&blk.f1.w);
-        b[lo + L0_F1B..lo + L0_F1B + D].copy_from_slice(&blk.f1.b);
+
+    let mut buffer = vec![0.0f32; WEIGHT_COUNT];
+    buffer[OFF_PATCH_WEIGHTS..OFF_PATCH_WEIGHTS + MODEL_DIM * PATCH_DIM]
+        .copy_from_slice(&model.patch_embed.weights);
+    buffer[OFF_PATCH_BIAS..OFF_PATCH_BIAS + MODEL_DIM].copy_from_slice(&model.patch_embed.bias);
+    buffer[OFF_POSITIONAL..OFF_POSITIONAL + PATCH_COUNT * MODEL_DIM].copy_from_slice(&model.positional);
+    buffer[OFF_NOTE_WEIGHTS..OFF_NOTE_WEIGHTS + MODEL_DIM * NOTE_FEATURE_DIM]
+        .copy_from_slice(&model.note_embed.weights);
+    buffer[OFF_NOTE_BIAS..OFF_NOTE_BIAS + MODEL_DIM].copy_from_slice(&model.note_embed.bias);
+
+    for (index, block) in model.blocks.iter().enumerate() {
+        let base = BLOCK_BASE + index * BLOCK_SIZE;
+        buffer[base + B_ATTN_GAIN..base + B_ATTN_GAIN + MODEL_DIM].copy_from_slice(&block.norm_attention.gain);
+        buffer[base + B_QUERY_WEIGHTS..base + B_QUERY_WEIGHTS + MODEL_DIM * MODEL_DIM]
+            .copy_from_slice(&block.query.weights);
+        buffer[base + B_QUERY_BIAS..base + B_QUERY_BIAS + MODEL_DIM].copy_from_slice(&block.query.bias);
+        buffer[base + B_KEY_WEIGHTS..base + B_KEY_WEIGHTS + MODEL_DIM * MODEL_DIM]
+            .copy_from_slice(&block.key.weights);
+        buffer[base + B_KEY_BIAS..base + B_KEY_BIAS + MODEL_DIM].copy_from_slice(&block.key.bias);
+        buffer[base + B_VALUE_WEIGHTS..base + B_VALUE_WEIGHTS + MODEL_DIM * MODEL_DIM]
+            .copy_from_slice(&block.value.weights);
+        buffer[base + B_VALUE_BIAS..base + B_VALUE_BIAS + MODEL_DIM].copy_from_slice(&block.value.bias);
+        buffer[base + B_OUT_WEIGHTS..base + B_OUT_WEIGHTS + MODEL_DIM * MODEL_DIM]
+            .copy_from_slice(&block.out.weights);
+        buffer[base + B_OUT_BIAS..base + B_OUT_BIAS + MODEL_DIM].copy_from_slice(&block.out.bias);
+        buffer[base + B_FFN_GAIN..base + B_FFN_GAIN + MODEL_DIM].copy_from_slice(&block.norm_ffn.gain);
+        buffer[base + B_FFN_IN_WEIGHTS..base + B_FFN_IN_WEIGHTS + FFN_DIM * MODEL_DIM]
+            .copy_from_slice(&block.ffn_in.weights);
+        buffer[base + B_FFN_IN_BIAS..base + B_FFN_IN_BIAS + FFN_DIM].copy_from_slice(&block.ffn_in.bias);
+        buffer[base + B_FFN_OUT_WEIGHTS..base + B_FFN_OUT_WEIGHTS + MODEL_DIM * FFN_DIM]
+            .copy_from_slice(&block.ffn_out.weights);
+        buffer[base + B_FFN_OUT_BIAS..base + B_FFN_OUT_BIAS + MODEL_DIM].copy_from_slice(&block.ffn_out.bias);
     }
-    b[OFF_FC..OFF_FC + QD].copy_from_slice(&v.fc.w);
-    b[OFF_FC + QD] = v.fc.b[0];
-    b
+
+    buffer[OFF_CLASSIFIER..OFF_CLASSIFIER + FUSED_DIM].copy_from_slice(&model.classifier.weights);
+    buffer[OFF_CLASSIFIER + FUSED_DIM] = model.classifier.bias[0];
+    buffer
 }
 
-fn storage_ent(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -98,7 +124,7 @@ fn storage_ent(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn uniform_ent(binding: u32) -> wgpu::BindGroupLayoutEntry {
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -111,36 +137,36 @@ fn uniform_ent(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn load_shader(dev: &wgpu::Device) -> wgpu::ShaderModule {
-    dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+fn load_shader(device: &wgpu::Device) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vit"),
         source: wgpu::ShaderSource::Wgsl(include_str!("gpu_shader/vit.wgsl").into()),
     })
 }
 
-fn make_pipeline_with_shader(
-    dev: &wgpu::Device,
-    lay: &wgpu::BindGroupLayout,
-    ep: &str,
-    sh: &wgpu::ShaderModule,
+fn compute_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    entry_point: &str,
+    shader: &wgpu::ShaderModule,
 ) -> wgpu::ComputePipeline {
-    let pl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("vit"),
-        bind_group_layouts: &[lay],
+        bind_group_layouts: &[layout],
         push_constant_ranges: &[],
     });
-    dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(ep),
-        layout: Some(&pl),
-        module: sh,
-        entry_point: Some(ep),
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry_point),
+        layout: Some(&pipeline_layout),
+        module: shader,
+        entry_point: Some(entry_point),
         cache: None,
         compilation_options: wgpu::PipelineCompilationOptions::default(),
     })
 }
 
-fn storage_buf(dev: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
-    dev.create_buffer(&wgpu::BufferDescriptor {
+fn storage_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.max(4),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
@@ -152,21 +178,21 @@ struct Inner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
-    p_embed: wgpu::ComputePipeline,
-    p_enc: wgpu::ComputePipeline,
-    p_qry: wgpu::ComputePipeline,
-    uni: wgpu::Buffer,
-    img: wgpu::Buffer,
-    tk: wgpu::Buffer,
-    tkb: wgpu::Buffer,
-    wt: wgpu::Buffer,
-    qin: wgpu::Buffer,
-    qp: wgpu::Buffer,
-    out: wgpu::Buffer,
-    q_cap: usize,
+    embed_pipeline: wgpu::ComputePipeline,
+    encode_pipeline: wgpu::ComputePipeline,
+    classify_pipeline: wgpu::ComputePipeline,
+    params: wgpu::Buffer,
+    frame: wgpu::Buffer,
+    tokens_a: wgpu::Buffer,
+    tokens_b: wgpu::Buffer,
+    weights: wgpu::Buffer,
+    query_features: wgpu::Buffer,
+    query_patches: wgpu::Buffer,
+    logits: wgpu::Buffer,
+    query_capacity: usize,
 }
 
-/// GPU handle for ViT forward. Cheap to clone (shared inner).
+/// GPU handle for the ViT forward pass. Cheap to clone: the buffers are shared.
 #[derive(Clone)]
 pub struct VitGpu {
     inner: std::sync::Arc<Inner>,
@@ -178,31 +204,53 @@ impl std::fmt::Debug for VitGpu {
     }
 }
 
-async fn try_init(v: &V) -> Option<Inner> {
-    let inst = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12 | wgpu::Backends::METAL,
+async fn try_init(model: &HandVisionTransformer, force: bool) -> Option<Inner> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        // GL is included so machines without Vulkan/DX12 still reach a real GPU.
+        backends: wgpu::Backends::VULKAN
+            | wgpu::Backends::METAL
+            | wgpu::Backends::DX12
+            | wgpu::Backends::GL,
         ..Default::default()
     });
-    let adapter = inst
+    let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
         })
         .await
-        .ok()?;
-    let info = adapter.get_info();
-    let n = info.name.to_lowercase();
-    if n.contains("llvmpipe")
-        || n.contains("swiftshader")
-        || n.contains("software")
-        || n.contains("virtual")
-        || n.contains("warp")
-        || n.contains("basic render")
     {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            println!("[hand AI] no wgpu adapter on Vulkan/DX12/Metal/OpenGL: {error}");
+            return None;
+        }
+    };
+
+    let info = adapter.get_info();
+    println!(
+        "[hand AI] wgpu adapter: {} [{:?}, {:?}]",
+        info.name, info.device_type, info.backend
+    );
+    let name = info.name.to_lowercase();
+    let software = matches!(info.device_type, wgpu::DeviceType::Cpu)
+        || name.contains("llvmpipe")
+        || name.contains("swiftshader")
+        || name.contains("software")
+        || name.contains("virtual")
+        || name.contains("warp")
+        || name.contains("basic render")
+        || info.vendor == 0x10005
+        || (info.vendor == 0x8086 && name.contains("haswell"));
+    if software && !force {
+        println!(
+            "[hand AI] software/virtual adapter, using the CPU path (PRPR_VIT_GPU=force overrides)"
+        );
         return None;
     }
-    let (device, queue) = adapter
+
+    let (device, queue) = match adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("vit"),
             required_features: wgpu::Features::empty(),
@@ -211,236 +259,253 @@ async fn try_init(v: &V) -> Option<Inner> {
             trace: wgpu::Trace::Off,
         })
         .await
-        .ok()?;
+    {
+        Ok(pair) => pair,
+        Err(error) => {
+            println!("[hand AI] adapter {} rejected the device request: {error}", info.name);
+            return None;
+        }
+    };
 
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("vit"),
         entries: &[
-            uniform_ent(0),
-            storage_ent(1, true),
-            storage_ent(2, false),
-            storage_ent(3, true),
-            storage_ent(4, true),
-            storage_ent(5, false),
-            storage_ent(6, true),
-            storage_ent(7, false),
+            uniform_entry(0),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            storage_entry(5, false),
+            storage_entry(6, true),
+            storage_entry(7, false),
         ],
     });
 
     let shader = load_shader(&device);
-    let p_embed = make_pipeline_with_shader(&device, &layout, "embed", &shader);
-    let p_enc = make_pipeline_with_shader(&device, &layout, "enc", &shader);
-    let p_qry = make_pipeline_with_shader(&device, &layout, "qry", &shader);
+    let embed_pipeline = compute_pipeline(&device, &layout, "embed", &shader);
+    let encode_pipeline = compute_pipeline(&device, &layout, "encode", &shader);
+    let classify_pipeline = compute_pipeline(&device, &layout, "classify", &shader);
 
-    let uni = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("vit.uni"),
-        size: 16,
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vit.params"),
+        size: std::mem::size_of::<VitParams>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
 
-    let wt_data = pack(v);
-    let wt = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("vit.w"),
-        contents: bytemuck::cast_slice(&wt_data),
+    let packed = pack(model);
+    let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("vit.weights"),
+        contents: bytemuck::cast_slice(&packed),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let img_bytes = (crate::hand::AI_IMAGE_SIZE * 4) as u64;
-    let tk_bytes = ((NP * D) * 4) as u64;
-    let q_cap = 512usize;
-    let img = storage_buf(&device, "vit.img", img_bytes);
-    let tk = storage_buf(&device, "vit.tk", tk_bytes);
-    let tkb = storage_buf(&device, "vit.tkb", tk_bytes);
-    let qin = storage_buf(&device, "vit.qin", (q_cap * NF * 4) as u64);
-    let qp = storage_buf(&device, "vit.qp", (q_cap * 4) as u64);
-    let out = storage_buf(&device, "vit.out", (q_cap * 4) as u64);
+    let query_capacity = 1024usize;
+    let frame = storage_buffer(&device, "vit.frame", (crate::hand::AI_IMAGE_SIZE * 4) as u64);
+    let tokens_a = storage_buffer(&device, "vit.tokens_a", ((PATCH_COUNT * MODEL_DIM) * 4) as u64);
+    let tokens_b = storage_buffer(&device, "vit.tokens_b", ((PATCH_COUNT * MODEL_DIM) * 4) as u64);
+    let query_features = storage_buffer(&device, "vit.query_features", (query_capacity * NOTE_FEATURE_DIM * 4) as u64);
+    let query_patches = storage_buffer(&device, "vit.query_patches", (query_capacity * 4) as u64);
+    let logits = storage_buffer(&device, "vit.logits", (query_capacity * 4) as u64);
+
+    println!("[hand AI] ViT running on the GPU ({})", info.name);
 
     Some(Inner {
         device,
         queue,
         layout,
-        p_embed,
-        p_enc,
-        p_qry,
-        uni,
-        img,
-        tk,
-        tkb,
-        wt,
-        qin,
-        qp,
-        out,
-        q_cap,
+        embed_pipeline,
+        encode_pipeline,
+        classify_pipeline,
+        params,
+        frame,
+        tokens_a,
+        tokens_b,
+        weights,
+        query_features,
+        query_patches,
+        logits,
+        query_capacity,
     })
 }
 
 impl VitGpu {
-    /// One-shot init (blocking). `None` => caller must use CPU.
-    pub fn try_new(v: &V) -> Option<Self> {
-        if !v.val() {
+    /// Blocking one-shot init; `None` means the caller must stay on the CPU path.
+    /// The first rejection is latched for the process, and a driver that panics
+    /// on the shader or pipelines never takes the AI worker thread down.
+    pub fn try_new(model: &HandVisionTransformer) -> Option<Self> {
+        if GPU_REJECTED.load(Ordering::Relaxed) {
             return None;
         }
-        let rt = tokio::runtime::Runtime::new().ok()?;
-        let inner = rt.block_on(try_init(v))?;
+        let force = match gpu_policy() {
+            GpuPolicy::Off => {
+                GPU_REJECTED.store(true, Ordering::Relaxed);
+                println!("[hand AI] PRPR_VIT_GPU=off, using the CPU path");
+                return None;
+            }
+            GpuPolicy::Force => true,
+            GpuPolicy::Auto => false,
+        };
+        if !model.validate() {
+            return None;
+        }
+        let runtime = tokio::runtime::Runtime::new().ok()?;
+        let inner = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(try_init(model, force))
+        })) {
+            Ok(Some(inner)) => inner,
+            Ok(None) => {
+                GPU_REJECTED.store(true, Ordering::Relaxed);
+                return None;
+            }
+            Err(_) => {
+                GPU_REJECTED.store(true, Ordering::Relaxed);
+                println!("[hand AI] ViT shader/pipeline creation failed, using the CPU path");
+                return None;
+            }
+        };
         Some(Self {
             inner: std::sync::Arc::new(inner),
         })
     }
 
-    /// Forward: frame + per-note features [nq, NF] + patch idx -> right-logits.
-    pub fn forward(&self, img: &[f32], qfeat: &[f32], qpk: &[u32]) -> Option<Vec<f32>> {
-        let nq = qpk.len();
-        if nq == 0 {
-            return Some(vec![]);
+    /// Number of queries one `forward` call accepts; larger sets are chunked by
+    /// the caller.
+    pub fn query_capacity(&self) -> usize {
+        self.inner.query_capacity
+    }
+
+    /// `frame` plus per-note features `[query_count, NOTE_FEATURE_DIM]` and patch
+    /// indices -> one right-hand logit per note.
+    pub fn forward(&self, frame: &[f32], features: &[f32], patches: &[u32]) -> Option<Vec<f32>> {
+        let query_count = patches.len();
+        if query_count == 0 {
+            return Some(Vec::new());
         }
-        let r = &self.inner;
-        if nq > r.q_cap || qfeat.len() < nq * NF {
+        let inner = &self.inner;
+        if query_count > inner.query_capacity || features.len() < query_count * NOTE_FEATURE_DIM {
             return None;
         }
 
-        let mut p = VitP {
-            nq: nq as u32,
+        let mut params = VitParams {
+            query_count: query_count as u32,
             layer: 0,
-            _p0: 0,
-            _p1: 0,
+            final_in_second: 0,
+            _pad: 0,
         };
-        r.queue.write_buffer(&r.uni, 0, bytemuck::bytes_of(&p));
-        r.queue
-            .write_buffer(&r.img, 0, bytemuck::cast_slice(&img[..img.len().min(crate::hand::AI_IMAGE_SIZE)]));
-        r.queue.write_buffer(&r.qin, 0, bytemuck::cast_slice(qfeat));
-        r.queue.write_buffer(&r.qp, 0, bytemuck::cast_slice(qpk));
+        inner.queue.write_buffer(&inner.params, 0, bytemuck::bytes_of(&params));
+        inner.queue.write_buffer(
+            &inner.frame,
+            0,
+            bytemuck::cast_slice(&frame[..frame.len().min(crate::hand::AI_IMAGE_SIZE)]),
+        );
+        inner.queue.write_buffer(&inner.query_features, 0, bytemuck::cast_slice(features));
+        inner.queue.write_buffer(&inner.query_patches, 0, bytemuck::cast_slice(patches));
 
-        // One bind group for all passes: qry reads tk/tkb via bindings 2/7 and
-        // never touches img, so binding 1 keeps the read-only img buffer.
-        let bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &r.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: r.uni.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: r.img.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: r.tk.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: r.wt.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: r.qin.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: r.out.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: r.qp.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: r.tkb.as_entire_binding(),
-                    },
-                ],
-                label: Some("vit.bg"),
-            });
+        // One bind group serves every pass: `query` reads the token buffers via
+        // bindings 2 and 7 and never touches the frame.
+        let bind_group = inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &inner.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: inner.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: inner.frame.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: inner.tokens_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: inner.weights.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: inner.query_features.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: inner.logits.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: inner.query_patches.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: inner.tokens_b.as_entire_binding() },
+            ],
+            label: Some("vit.bind_group"),
+        });
 
-        let wg = |n: u32| -> u32 { n.div_ceil(64) };
+        let groups = |count: u32| count.div_ceil(64);
 
-        // Separate submits so layer uniform updates are visible per pass.
+        // The encoder reads a uniform written just before each pass, so the
+        // passes are submitted separately.
         {
-            let mut e = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("vit.embed"),
             });
             {
-                let mut c = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("embed"),
                     timestamp_writes: None,
                 });
-                c.set_pipeline(&r.p_embed);
-                c.set_bind_group(0, &bg, &[]);
-                c.dispatch_workgroups(wg(NP as u32), 1, 1);
+                pass.set_pipeline(&inner.embed_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(groups(PATCH_COUNT as u32), 1, 1);
             }
-            r.queue.submit(Some(e.finish()));
+            inner.queue.submit(Some(encoder.finish()));
         }
 
-        for li in 0..NL {
-            p.layer = li as u32;
-            r.queue.write_buffer(&r.uni, 0, bytemuck::bytes_of(&p));
-            let mut e = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("vit.enc"),
+        for layer in 0..BLOCK_COUNT {
+            params.layer = layer as u32;
+            inner.queue.write_buffer(&inner.params, 0, bytemuck::bytes_of(&params));
+            let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vit.encode"),
             });
             {
-                let mut c = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("enc"),
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("encode"),
                     timestamp_writes: None,
                 });
-                c.set_pipeline(&r.p_enc);
-                c.set_bind_group(0, &bg, &[]);
-                c.dispatch_workgroups(wg(NP as u32), 1, 1);
+                pass.set_pipeline(&inner.encode_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(groups(PATCH_COUNT as u32), 1, 1);
             }
-            r.queue.submit(Some(e.finish()));
+            inner.queue.submit(Some(encoder.finish()));
         }
 
-        p.layer = 0;
-        // After NL ping-pong enc layers: tokens in tkb iff NL is odd
-        p._p0 = (NL as u32) & 1;
-        r.queue.write_buffer(&r.uni, 0, bytemuck::bytes_of(&p));
+        params.layer = 0;
+        params.final_in_second = (BLOCK_COUNT as u32) & 1;
+        inner.queue.write_buffer(&inner.params, 0, bytemuck::bytes_of(&params));
         {
-            let mut e = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("vit.qry"),
+            let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vit.classify"),
             });
             {
-                let mut c = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("qry"),
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("classify"),
                     timestamp_writes: None,
                 });
-                c.set_pipeline(&r.p_qry);
-                c.set_bind_group(0, &bg, &[]);
-                c.dispatch_workgroups(wg(nq as u32), 1, 1);
+                pass.set_pipeline(&inner.classify_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(groups(query_count as u32), 1, 1);
             }
-            r.queue.submit(Some(e.finish()));
+            inner.queue.submit(Some(encoder.finish()));
         }
 
-        let dst = r.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vit.dl"),
-            size: (nq * 4) as u64,
+        let readback = inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vit.readback"),
+            size: (query_count * 4) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut e2 = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("vit.dl"),
+        let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vit.readback"),
         });
-        e2.copy_buffer_to_buffer(&r.out, 0, &dst, 0, (nq * 4) as u64);
-        r.queue.submit(Some(e2.finish()));
+        encoder.copy_buffer_to_buffer(&inner.logits, 0, &readback, 0, (query_count * 4) as u64);
+        inner.queue.submit(Some(encoder.finish()));
 
-        let sl = dst.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        sl.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
         });
-        let _ = r.device.poll(wgpu::PollType::Wait);
-        if rx.recv().ok().and_then(|x| x.ok()).is_none() {
+        let _ = inner.device.poll(wgpu::PollType::Wait);
+        if receiver.recv().ok().and_then(|result| result.ok()).is_none() {
             return None;
         }
         let mut logits = {
-            let data = sl.get_mapped_range();
-            let v: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+            let data = slice.get_mapped_range();
+            let values: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
-            v
+            values
         };
-        dst.unmap();
-        if logits.len() < nq {
-            logits.resize(nq, 0.0);
-        }
-        if logits.iter().any(|x| x.is_nan()) {
+        readback.unmap();
+        logits.resize(query_count, 0.0);
+        if logits.iter().any(|value| value.is_nan()) {
             return None;
         }
         Some(logits)
@@ -452,53 +517,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pack_len_matches_layout() {
-        let v = V::n();
-        let b = pack(&v);
-        assert_eq!(b.len(), offs::W_LEN);
-        // OFF_FC(115136) + QD(128) + 1 bias
-        assert_eq!(b.len(), 115265);
+    fn packed_length_matches_layout() {
+        let model = HandVisionTransformer::new();
+        let packed = pack(&model);
+        assert_eq!(packed.len(), offs::WEIGHT_COUNT);
+        assert_eq!(packed.len(), 115009);
     }
 
     #[test]
-    fn vit_wgsl_parses() {
-        // Same front-end as wgpu create_shader_module — fails fast on syntax.
+    fn vit_wgsl_parses_and_validates() {
         match naga::front::wgsl::parse_str(include_str!("gpu_shader/vit.wgsl")) {
-            Ok(m) => {
+            Ok(module) => {
                 let mut validator = naga::valid::Validator::new(
                     naga::valid::ValidationFlags::all(),
                     naga::valid::Capabilities::all(),
                 );
-                if let Err(e) = validator.validate(&m) {
-                    panic!("vit.wgsl validation failed: {e}");
+                if let Err(error) = validator.validate(&module) {
+                    panic!("vit.wgsl validation failed: {error}");
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 panic!(
                     "vit.wgsl parse failed:\n{}",
-                    e.emit_to_string(include_str!("gpu_shader/vit.wgsl"))
+                    error.emit_to_string(include_str!("gpu_shader/vit.wgsl"))
                 );
             }
         }
     }
 
-    /// End-to-end: creates pipelines (catches layout mismatches) and runs
-    /// embed/enc/qry. Skips when no GPU adapter is available.
+    /// Skipped when no hardware adapter is available.
     #[test]
-    fn vit_gpu_forward_runs() {
-        let v = V::n();
-        let Some(g) = VitGpu::try_new(&v) else {
+    fn gpu_forward_runs() {
+        let model = HandVisionTransformer::new();
+        let Some(gpu) = VitGpu::try_new(&model) else {
             eprintln!("skip: no GPU adapter");
             return;
         };
-        let img = vec![0.5f32; crate::hand::AI_IMAGE_SIZE];
-        let nq = 3usize;
-        let qfeat = vec![0.1f32; nq * NF];
-        let qpk = vec![0u32, 70, 143];
-        let out = g
-            .forward(&img, &qfeat, &qpk)
+        let frame = vec![0.5f32; crate::hand::AI_IMAGE_SIZE];
+        let query_count = 3usize;
+        let features = vec![0.1f32; query_count * NOTE_FEATURE_DIM];
+        let patches = vec![0u32, 70, 143];
+        let logits = gpu
+            .forward(&frame, &features, &patches)
             .expect("gpu forward failed (validation error or NaN)");
-        assert_eq!(out.len(), nq);
-        assert!(out.iter().all(|x| x.is_finite()));
+        assert_eq!(logits.len(), query_count);
+        assert!(logits.iter().all(|value| value.is_finite()));
     }
 }

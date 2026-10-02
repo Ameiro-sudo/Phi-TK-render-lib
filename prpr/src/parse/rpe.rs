@@ -18,8 +18,6 @@ use image::{codecs::gif, AnimationDecoder, DynamicImage};
 use std::{collections::HashMap, time::Duration};
 use crate::ext::SafeTexture;
 use crate::core::note::Hand;
-use crate::hand::assign_hands;
-use crate::config::Config;
 use std::sync::{Arc, Mutex};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -94,7 +92,11 @@ fn f32_one() -> f32 {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RPEEvent<T = f32> {
-    // TODO linkgroup
+    /// RPE 的绑定组 ID：相同非 0 值的事件在编辑器中被关联（链式编辑）。
+    /// 它只用于 RPE 标记，对谱面读取与播放没有任何影响，因此这里仅解析存档。
+    #[serde(default)]
+    #[allow(dead_code)]
+    linkgroup: i32,
     #[serde(default = "f32_zero")]
     easing_left: f32,
     #[serde(default = "f32_one")]
@@ -110,6 +112,24 @@ struct RPEEvent<T = f32> {
     end_time: Triple,
 }
 
+impl<T> RPEEvent<T> {
+    /// The tween governing the segment that starts at this event's `startTime`.
+    ///
+    /// Factored out of `parse_events` so that `parse_gif_events` can reuse it.
+    fn tween(&self, bezier_map: &BezierMap) -> Arc<dyn TweenFunction> {
+        let tween = RPE_TWEEN_MAP.get(self.easing_type.max(1) as usize)
+            .copied()
+            .unwrap_or(RPE_TWEEN_MAP[0]);
+        if self.bezier != 0 {
+            Arc::clone(&bezier_map[&bezier_key(self)])
+        } else if self.easing_left.abs() < EPS && (self.easing_right - 1.0).abs() < EPS {
+            StaticTween::get_arc(tween)
+        } else {
+            Arc::new(ClampedTween::new(tween, self.easing_left..self.easing_right))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RPECtrlEvent {
@@ -122,7 +142,10 @@ struct RPECtrlEvent {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RPESpeedEvent {
-    // TODO linkgroup
+    /// 见 `RPEEvent::linkgroup`：仅 RPE 编辑器标记用，读取时不使用。
+    #[serde(default)]
+    #[allow(dead_code)]
+    linkgroup: i32,
     start_time: Triple,
     end_time: Triple,
     start: f32,
@@ -162,9 +185,10 @@ struct RPEExtendedEvents {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RPENote {
-    // TODO above == 0? what does that even mean?
     #[serde(rename = "type")]
     kind: u8,
+    /// `1` = 音符从判定线的正面下落；其余数值（含 `0`）= 从背面下落。
+    /// 这里读取时统一按 `above == 1` 判定为正面。
     above: u8,
     start_time: Triple,
     end_time: Triple,
@@ -180,8 +204,15 @@ struct RPENote {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RPEJudgeLine {
-    // TODO group
-    // TODO bpmfactor
+    /// 判定线所属的组索引（对应谱面根级的 `judgeLineGroup` 字符串数组）。
+    /// 谱面读取时不会使用这个属性，仅为 RPE 标记，因此这里只解析存档。
+    #[serde(rename = "Group", default)]
+    #[allow(dead_code)]
+    group: i32,
+    /// 本线的 BPM 因子，默认 `1.0`（RPE 中无法编辑该字段）。
+    /// 本线的当前 BPM 为 `nowBpm / bpmfactor`，见 [`BpmList::scaled`]。
+    #[serde(default = "f32_one")]
+    bpmfactor: f32,
     #[serde(rename = "Name")]
     name: String,
     #[serde(rename = "Texture")]
@@ -246,24 +277,77 @@ fn parse_events<T: Tweenable, V: Clone + Into<T>>(
         }
     }
     for e in rpe {
-        let tween = RPE_TWEEN_MAP.get(e.easing_type.max(1) as usize)
-            .copied()
-            .unwrap_or(RPE_TWEEN_MAP[0]);
         kfs.push(Keyframe {
             time: r.time(&e.start_time),
             value: e.start.clone().into(),
-            tween: {
-                if e.bezier != 0 {
-                    Arc::clone(&bezier_map[&bezier_key(e)])
-                } else if e.easing_left.abs() < EPS && (e.easing_right - 1.0).abs() < EPS {
-                    StaticTween::get_arc(tween)
-                } else {
-                    Arc::new(ClampedTween::new(tween, e.easing_left..e.easing_right))
-                }
-            },
+            tween: e.tween(bezier_map),
         });
         kfs.push(Keyframe::new(r.time(&e.end_time), e.end.clone().into(), 0));
     }
+    Ok(Anim::new(kfs))
+}
+
+/// RPE 的 `gifEvents` 是把 GIF 的**播放进度**（`0.0..=1.0`）当成事件值来动画的，
+/// 而不是普通的关键帧数值：事件之间 GIF 必须按自己的时长自动循环播放，
+/// 事件接管的那一刻则要先停在循环已经走到的进度上，再跳到事件给定的值。
+/// 因此这里除了事件本身，还要显式插入"回卷"关键帧（进度 `1.0` 立刻回到 `0.0`），
+/// 事件结束后也要让进度继续以 GIF 的循环速率推进——不能直接用 [`parse_events`]。
+fn parse_gif_events(
+    r: &mut BpmList,
+    rpe: &[RPEEvent],
+    bezier_map: &BezierMap,
+    gif: &GifFrames,
+) -> Result<Anim<f32>> {
+    let total_time = gif.total_time();
+    // 循环周期为 0 的 GIF 无从推进，渲染侧会一直回退到最后一帧。
+    if total_time == 0 {
+        return Ok(Anim::default());
+    }
+    // 首尾两处"空转"关键帧的时间上限，足以覆盖任何实际谱面。
+    const GIF_MAX_TIME: f32 = 2000.;
+    // 同时限制关键帧总量：周期极短的 GIF 反复回卷会产生海量关键帧。
+    const GIF_MAX_KEYFRAMES: usize = 1 << 20;
+    let mut kfs = vec![Keyframe::new(0.0, 0.0, 2)];
+    let mut next_rep_time: u128 = 0;
+    for e in rpe {
+        let start = r.time(&e.start_time);
+        let end = r.time(&e.end_time);
+        // 事件开始前，先把 GIF 空转过的每一圈补上回卷关键帧。
+        while start > next_rep_time as f32 / 1000.
+            && next_rep_time as f32 / 1000. < GIF_MAX_TIME
+            && kfs.len() < GIF_MAX_KEYFRAMES
+        {
+            kfs.push(Keyframe::new(next_rep_time as f32 / 1000., 1.0, 0));
+            kfs.push(Keyframe::new(next_rep_time as f32 / 1000., 0.0, 2));
+            next_rep_time += total_time;
+        }
+        // 事件接管时，GIF 正好停在本圈循环的这个进度上。
+        let raw_stop = 1. - (next_rep_time as f32 - start * 1000.) / total_time as f32;
+        let stop_prog = if raw_stop.is_finite() { raw_stop.clamp(0., 1.) } else { 0. };
+        let end_val = e.end;
+        kfs.push(Keyframe::new(start, stop_prog, 0));
+        kfs.push(Keyframe {
+            time: start,
+            value: e.start,
+            tween: e.tween(bezier_map),
+        });
+        kfs.push(Keyframe::new(end, end_val, 2));
+        // 事件结束后进度仍按 `1 / total_time` 的速率推进，直到走满这一圈。
+        let end_ms = (end * 1000.).max(0.);
+        let next = (end_ms + total_time as f32 * (1. - end_val)).round().max(end_ms);
+        // 不得回退，否则后续回卷关键帧会早于刚刚写入的关键帧。
+        next_rep_time = (next as u128).max(next_rep_time);
+    }
+
+    // 最后一个事件之后 GIF 继续自动循环（"若当前播放进度没有 gifEvents 时，GIF 会自动循环播放"）。
+    while GIF_MAX_TIME > next_rep_time as f32 / 1000. && kfs.len() < GIF_MAX_KEYFRAMES {
+        kfs.push(Keyframe::new(next_rep_time as f32 / 1000., 1.0, 0));
+        kfs.push(Keyframe::new(next_rep_time as f32 / 1000., 0.0, 2));
+        next_rep_time += total_time;
+    }
+    // 事件按时间递增且互不重叠；万一手工修改过的谱面出现乱序或重叠，
+    // 稳定排序保证 `Anim::set_time` 依赖的关键帧有序这一前提（等序相对顺序不变）。
+    kfs.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
     Ok(Anim::new(kfs))
 }
 
@@ -458,8 +542,24 @@ async fn parse_judge_line(
     fs: &mut dyn FileSystem,
     bezier_map: &BezierMap,
     texture_cache: &mut std::collections::HashMap<String, SafeTexture>,
-    id: usize
 ) -> Result<JudgeLine> {
+    // 每条判定线可带 `bpmfactor`（默认 1.0，RPE 中不可编辑）：本线的当前 BPM 为
+    // `nowBpm / bpmfactor`，因此本线的 beat→秒换算整体是谱面级换算的 `bpmfactor` 倍。
+    // 换成按线缩放的 BpmList 后，事件、音符与本线的速度事件都会自然随之缩放。
+    let bpmfactor = if rpe.bpmfactor.is_finite() && rpe.bpmfactor != 1.0 {
+        rpe.bpmfactor
+    } else {
+        1.0
+    };
+    // 速度事件的时间上限属于本线时间轴，需一并缩放；
+    // `bpmfactor == 1.0` 时 `x * 1.0` 恒等，行为与改动前完全一致。
+    let max_time = max_time * bpmfactor;
+    let mut scaled = (bpmfactor != 1.0).then(|| r.scaled(bpmfactor));
+    let r = match scaled.as_mut() {
+        Some(it) => it,
+        None => r,
+    };
+
     let event_layers: Vec<_> = rpe.event_layers.into_iter().flatten().collect();
 
     fn events_with_factor(
@@ -482,12 +582,58 @@ async fn parse_judge_line(
 
     let mut height = parse_speed_events(r, &event_layers, max_time)?;
     let mut notes = parse_notes(r, rpe.notes.unwrap_or_default(), &mut height)?;
-    let config = Config::default();
-    let mut rotation = events_with_factor(r, &event_layers, |it| &it.rotate_events, -1., "rotate", bezier_map)?;
-    rotation.set_time(0.0);
-    let rotation_angle = rotation.now();
-    assign_hands(&mut notes, &config, id, rotation_angle, r);
     let cache = JudgeLineCache::new(&mut notes);
+
+    // `gifEvents` 存在时 `Texture` 指向的就是 GIF 文件，因此必须先于纹理名判定，
+    // 否则这类判定线会被当成静态纹理，`gifEvents` 整条被忽略。
+    let kind = if let Some(events) = rpe.extended.as_ref().and_then(|e| e.gif_events.as_ref()) {
+        let data = fs
+            .load_file(&rpe.texture)
+            .await
+            .with_context(|| ptl!("gif-load-failed", "path" => rpe.texture.clone()))?;
+        let decoder = gif::GifDecoder::new(&data[..])?;
+        let frames = GifFrames::new(
+            decoder
+                .into_frames()
+                .map(|frame| -> (u128, SafeTexture) {
+                    let frame = frame.unwrap();
+                    let delay: Duration = frame.delay().into();
+                    (delay.as_millis(), SafeTexture::from(DynamicImage::ImageRgba8(frame.into_buffer())))
+                })
+                .collect(),
+        );
+        let events = parse_gif_events(r, events, bezier_map, &frames).with_context(|| ptl!("gif-events-parse-failed"))?;
+        JudgeLineKind::TextureGif(events, frames, rpe.texture.clone())
+    } else if rpe.texture == "line.png" {
+        if let Some(events) = rpe.extended.as_ref().and_then(|e| e.paint_events.as_ref()) {
+            JudgeLineKind::Paint(
+                parse_events(r, events, Some(-1.), bezier_map).with_context(|| ptl!("paint-events-parse-failed"))?,
+                Arc::new(Mutex::new((None, false))),
+            )
+        } else if let Some(events) = rpe.extended.as_ref().and_then(|e| e.text_events.as_ref()) {
+            JudgeLineKind::Text(
+                parse_events(r, events, Some(String::new()), bezier_map)
+                    .with_context(|| ptl!("text-events-parse-failed"))?,
+            )
+        } else {
+            JudgeLineKind::Normal
+        }
+    } else {
+        match texture_cache.get(&rpe.texture) {
+            Some(texture) => JudgeLineKind::Texture(texture.clone(), rpe.texture.clone()),
+            None => {
+                let img_data = fs
+                    .load_file(&rpe.texture)
+                    .await
+                    .with_context(|| ptl!("illustration-load-failed", "path" => rpe.texture.clone()))?;
+                let img = image::load_from_memory(&img_data)?;
+                let texture = SafeTexture::from_image(&img).with_mipmap();
+                texture_cache.insert(rpe.texture.clone(), texture.clone());
+
+                JudgeLineKind::Texture(texture, rpe.texture.clone())
+            }
+        }
+    };
 
     Ok(JudgeLine {
         object: Object {
@@ -510,7 +656,10 @@ async fn parse_judge_line(
                 let factor = if rpe.texture == "line.png" {
                     1.
                 } else {
-                    2. / RPE_WIDTH /*TODO tweak*/
+                    // `line.png` 的缩放以 1.0 为基准；其他纹理沿用 moveX 的同一个
+                    // 换算系数（RPE 画布宽 `RPE_WIDTH` = 1350px ↔ 引擎单位 2.0），
+                    // 属于单位换算，不是经验调参值。
+                    2. / RPE_WIDTH
                 };
                 rpe.extended
                     .as_ref()
@@ -553,56 +702,7 @@ async fn parse_judge_line(
             AnimFloat::default()
         },
         notes,
-        kind: if rpe.texture == "line.png" {
-            if let Some(events) = rpe.extended.as_ref().and_then(|e| e.paint_events.as_ref()) {
-                JudgeLineKind::Paint(
-                    parse_events(r, events, Some(-1.), bezier_map).with_context(|| ptl!("paint-events-parse-failed"))?,
-                    Arc::new(Mutex::new((None, false))),
-                )
-            } else if let Some(extended) = rpe.extended.as_ref() {
-                if let Some(events) = extended.gif_events.as_ref() {
-                    let data = fs
-                        .load_file(&rpe.texture)
-                        .await
-                        .with_context(|| ptl!("gif-load-failed", "path" => rpe.texture.clone()))?;
-                    let decoder = gif::GifDecoder::new(&data[..])?;
-                    let frames = GifFrames::new(
-                        decoder
-                            .into_frames()
-                            .map(|frame| -> (u128, SafeTexture) {
-                                let frame = frame.unwrap();
-                                let delay: Duration = frame.delay().into();
-                                (delay.as_millis(), SafeTexture::from(DynamicImage::ImageRgba8(frame.into_buffer())))
-                            })
-                            .collect(),
-                    );
-                    // TODO: process events
-                    let events = parse_events(r, events, Some(0.), bezier_map).with_context(|| ptl!("gif-events-parse-failed"))?;
-                    JudgeLineKind::TextureGif(events, frames, rpe.texture.clone())
-                } else if let Some(events) = extended.text_events.as_ref() {
-                    JudgeLineKind::Text(parse_events(r, events, Some(String::new()), bezier_map).with_context(|| ptl!("text-events-parse-failed"))?)
-                } else {
-                    JudgeLineKind::Normal
-                }
-            } else {
-                JudgeLineKind::Normal
-            }
-        } else {
-            match texture_cache.get(&rpe.texture) {
-                Some(texture) => JudgeLineKind::Texture(texture.clone(), rpe.texture.clone()),
-                None => {
-                    let img_data = fs
-                        .load_file(&rpe.texture)
-                        .await
-                        .with_context(|| ptl!("illustration-load-failed", "path" => rpe.texture.clone()))?;
-                    let img = image::load_from_memory(&img_data)?;
-                    let texture = SafeTexture::from_image(&img).with_mipmap();
-                    texture_cache.insert(rpe.texture.clone(), texture.clone());
-
-                    JudgeLineKind::Texture(texture, rpe.texture.clone())
-                }
-            }
-        },
+        kind,
         color: if let Some(events) = rpe.extended.as_ref().and_then(|e| e.color_events.as_ref()) {
             parse_events(r, events, Some(Color::new(0.0, 0.0, 0.0, 0.0)), bezier_map).with_context(|| ptl!("color-events-parse-failed"))?
         } else {
@@ -705,7 +805,7 @@ pub async fn parse_rpe(source: &str, fs: &mut dyn FileSystem, extra: ChartExtra)
     for (id, rpe) in rpe.judge_line_list.into_iter().enumerate() {
         let name = rpe.name.clone();
         lines.push(
-            parse_judge_line(&mut r, rpe, max_time, fs, &bezier_map, &mut texture_cache, id)
+            parse_judge_line(&mut r, rpe, max_time, fs, &bezier_map, &mut texture_cache)
                 .await
                 .with_context(move || ptl!("judge-line-location-name", "jlid" => id, "name" => name))?,
         );

@@ -12,62 +12,37 @@ pub use rpe::{parse_rpe, RPE_HEIGHT, RPE_WIDTH};
 
 pub(crate) fn process_lines(v: &mut [crate::core::JudgeLine]) {
     use crate::ext::NotNanExt;
-
-    // 修复：验证所有父索引
+    use ordered_float::NotNan;
+    use std::collections::HashMap;
     let line_count = v.len();
     for line in v.iter_mut() {
         if let Some(parent_index) = line.parent {
             if parent_index >= line_count {
-                line.parent = None; // 无效索引，移除父关系
+                line.parent = None;
             }
         }
     }
 
-    let mut times = Vec::new();
-    // TODO optimize using k-merge sort
-    let sorts = v
-        .iter()
-        .map(|line| {
-            let mut idx: Vec<usize> = (0..line.notes.len()).collect();
-            idx.sort_by_key(|id| line.notes[*id].time.not_nan());
-            idx
-        })
-        .collect::<Vec<_>>();
-    for (line, idx) in v.iter_mut().zip(sorts.iter()) {
-        let v = &mut line.notes;
-        let mut i = 0;
-        while i < v.len() {
-            times.push(v[idx[i]].time.not_nan());
-            let mut j = i + 1;
-            while j < v.len() && v[idx[j]].time == v[idx[i]].time {
-                j += 1;
-            }
-            if j != i + 1 {
-                times.push(v[idx[i]].time.not_nan());
-            }
-            i = j;
+    // A note gets `multiple_hint` (the wider "double note" glyph) when at least
+    // one other note *anywhere in the chart* shares its exact time.
+    //
+    // This used to build a per-line index array (O(n log n)), concatenate every
+    // note time — duplicating the ones belonging to a same-time group — sort the
+    // whole list (O(n log n)) and finally walk it with a merge cursor. Counting
+    // occurrences directly is a single O(n) pass plus one O(n) lookup pass, and
+    // it never touches the note order.
+    let mut time_counts: HashMap<NotNan<f32>, u32> = HashMap::new();
+    for line in v.iter() {
+        for note in &line.notes {
+            *time_counts.entry(note.time.not_nan()).or_default() += 1;
         }
     }
-    times.sort();
-    let mut mt = Vec::new();
-    if !times.is_empty() {
-        for i in 0..(times.len() - 1) {
-            // since times are generated in the same way, theoretically we can compare them directly
-            if times[i] == times[i + 1] && (i == 0 || times[i - 1] != times[i]) {
-                mt.push(*times[i]);
-            }
-        }
-    }
-    for (line, idx) in v.iter_mut().zip(sorts.iter()) {
-        let mut i = 0;
-        for id in idx {
-            let note = &mut line.notes[*id];
-            let time = note.time;
-            while i < mt.len() && mt[i] < time {
-                i += 1;
-            }
-            if i < mt.len() && mt[i] == time {
-                note.multiple_hint = true;
+    if time_counts.values().any(|&c| c >= 2) {
+        for line in v.iter_mut() {
+            for note in line.notes.iter_mut() {
+                if time_counts.get(&note.time.not_nan()).copied().unwrap_or(0) >= 2 {
+                    note.multiple_hint = true;
+                }
             }
         }
     }

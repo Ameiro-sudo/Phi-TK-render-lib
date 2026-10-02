@@ -4,28 +4,21 @@ use crate::{
     ext::{draw_text_aligned, get_viewport, NotNanExt, SafeTexture},
     judge::{JudgeStatus, LIMIT_BAD},
     ui::Ui,
-    //hand::assign_hands,
     info::ChartFormat,
 };
 use macroquad::prelude::*;
-use macroquad::miniquad::{RenderPass, Texture, TextureParams, TextureWrap, FilterMode, TextureFormat};
+use macroquad::miniquad::{RenderPass, Texture, TextureParams, TextureWrap, FilterMode, TextureFormat, PassAction};
 use nalgebra::Rotation2;
 use serde::Deserialize;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
-//use crate::config::Config;
 
-// Thread-local buffers for hand assignment - avoids per-frame Vec allocations
 thread_local! {
-    static ENHANCED_NOTES_BUFFER: RefCell<Vec<(Vector, Vector)>> = RefCell::new(Vec::with_capacity(256));
-    static AI_NOTES_BUFFER: RefCell<Vec<crate::core::Note>> = RefCell::new(Vec::with_capacity(256));
+    static ENHANCED_NOTES_BUFFER: RefCell<Vec<Vector>> = RefCell::new(Vec::with_capacity(256));
 }
 
-/// A lightweight view into an `AnimFloat` that avoids cloning.
-/// Tracks time and cursor locally while borrowing the keyframes.
 struct AnimFloatView<'a> {
     anim: &'a AnimFloat,
     time: f32,
@@ -38,18 +31,27 @@ impl<'a> AnimFloatView<'a> {
     }
 
     fn set_time(&mut self, time: f32) {
-        if self.anim.keyframes.is_empty() || time == self.time {
+        let keyframes = &self.anim.keyframes;
+        if keyframes.is_empty() || time == self.time {
             self.time = time;
             return;
         }
-        while let Some(kf) = self.anim.keyframes.get(self.cursor + 1) {
-            if kf.time > time {
-                break;
+        // Notes are not visited in time order, so the cursor frequently jumps
+        // backwards. Walk when we are already close, binary search otherwise,
+        // otherwise a line of unsorted notes degrades to O(notes * keyframes).
+        let target = keyframes.partition_point(|kf| kf.time <= time).saturating_sub(1);
+        if self.cursor.abs_diff(target) > 8 {
+            self.cursor = target;
+        } else {
+            while let Some(kf) = keyframes.get(self.cursor + 1) {
+                if kf.time > time {
+                    break;
+                }
+                self.cursor += 1;
             }
-            self.cursor += 1;
-        }
-        while self.cursor != 0 && self.anim.keyframes[self.cursor].time > time {
-            self.cursor -= 1;
+            while self.cursor != 0 && keyframes[self.cursor].time > time {
+                self.cursor -= 1;
+            }
         }
         self.time = time;
     }
@@ -66,8 +68,6 @@ impl<'a> AnimFloatView<'a> {
             let t = (self.time - kf1.time) / (kf2.time - kf1.time);
             f32::tween(&kf1.value, &kf2.value, kf1.tween.y(t))
         };
-        // Handle next chain - for simplicity, assume single anim (no next)
-        // If next is needed, fall back to original behavior
         if self.anim.next.is_some() {
             self.anim.now_opt().unwrap_or(0.0)
         } else {
@@ -76,35 +76,8 @@ impl<'a> AnimFloatView<'a> {
     }
 }
 
-// 优化的纹理缓存懒加载
-static TEXTURE_CACHE: Lazy<RwLock<HashMap<usize, Texture2D>>> = Lazy::new(|| {
-    let map = HashMap::with_capacity(1024); // 预分配容量，减少重新分配
-    RwLock::new(map)
-});
-
-// 统一的翻转Y矩阵懒加载
 static FLIP_Y_MATRIX: Lazy<Matrix> = Lazy::new(|| {
     Matrix::identity().append_nonuniform_scaling(&Vector::new(1.0, -1.0))
-});
-
-// Painter缓存懒加载
-static PAINTER_CACHE: Lazy<Mutex<(RenderPass, Texture, (i32, i32, i32, i32))>> = Lazy::new(|| {
-    let gl = unsafe { get_internal_gl() };
-    let vp = get_viewport();
-
-    let tex = Texture::new_render_texture(
-        gl.quad_context,
-        TextureParams {
-            width: vp.2 as _,
-            height: vp.3 as _,
-            format: TextureFormat::RGBA8,
-            filter: FilterMode::Linear,
-            wrap: TextureWrap::Clamp,
-        },
-    );
-
-    let pass = RenderPass::new(gl.quad_context, tex.clone(), None);
-    Mutex::new((pass, tex, vp))
 });
 
 static RENDER_CONSTANTS: Lazy<RenderConstants> = Lazy::new(|| RenderConstants {
@@ -116,12 +89,6 @@ static RENDER_CONSTANTS: Lazy<RenderConstants> = Lazy::new(|| RenderConstants {
     line_width_loading: 0.0075,
 });
 
-// 视口角点世界坐标缓存 (viewport, [top-left, bottom-left, top-right, bottom-right])
-static VIEWPORT_CACHE: Lazy<Mutex<(Option<(i32, i32, i32, i32)>, Option<[Point; 4]>)>> = Lazy::new(|| {
-    Mutex::new((None, None))
-});
-
-// 渲染常量结构体
 struct RenderConstants {
     duration: f32,
     threshold: f32,
@@ -219,18 +186,8 @@ impl JudgeLineCache {
     }
 }
 
-struct Painter {
-    pass: RenderPass,
-    viewport: (i32, i32, i32, i32),
-    cleared: bool,
-    last_color_alpha: f32,
-    last_size: f32,
-    cached_texture: Option<Texture>,
-    cached_pass: Option<RenderPass>,
-}
-
 pub struct GifFrames {
-    /// time of each frame in milliseconds
+    /// cumulative end time (in milliseconds) of each frame, paired with it
     frames: Vec<(u128, SafeTexture)>,
     /// milliseconds
     total_time: u128,
@@ -238,24 +195,29 @@ pub struct GifFrames {
 
 impl GifFrames {
     pub fn new(frames: Vec<(u128, SafeTexture)>) -> Self {
-        let total_time = frames.iter().map(|(time, _)| *time).sum();
+        let mut total_time: u128 = 0;
+        let frames = frames
+            .into_iter()
+            .map(|(duration, texture)| {
+                total_time += duration;
+                (total_time, texture)
+            })
+            .collect();
         Self { frames, total_time }
     }
 
     pub fn get_time_frame(&self, time: u128) -> &SafeTexture {
-        let mut time = time % self.total_time;
-        for (t, frame) in &self.frames {
-            if time < *t {
-                return frame;
-            }
-            time -= t;
+        let fallback = &self.frames.last().expect("GifFrames has no frames").1;
+        if self.total_time == 0 {
+            return fallback;
         }
-        &self.frames.last().unwrap().1
+        let time = time % self.total_time;
+        // Prefix sums are kept in `frames`, so a linear scan is no longer needed.
+        let idx = self.frames.partition_point(|(end, _)| *end <= time);
+        &self.frames[idx].1
     }
 
     pub fn get_prog_frame(&self, prog: f32) -> &SafeTexture {
-        // TODO: For large frame counts (>30), consider using binary search (slice::binary_search_by)
-        // instead of linear scan to improve performance.
         let time = (prog * self.total_time as f32) as u128;
         self.get_time_frame(time)
     }
@@ -264,6 +226,7 @@ impl GifFrames {
         self.total_time
     }
 }
+
 
 pub struct JudgeLine {
     pub object: Object,
@@ -280,66 +243,6 @@ pub struct JudgeLine {
 
     pub cache: JudgeLineCache,
     pub cached_world_pos: Option<Vector>,
-}
-
-impl Painter {
-    pub fn new() -> Self {
-        let (pass, tex, vp) = {
-            let guard = PAINTER_CACHE.lock().unwrap();
-            (guard.0.clone(), guard.1.clone(), guard.2)
-        };
-
-        Painter {
-            pass,
-            viewport: vp,
-            cleared: false,
-            last_color_alpha: -1.0,
-            last_size: -1.0,
-            cached_texture: Some(tex),
-            cached_pass: Some(pass),
-        }
-    }
-
-    fn paint(&mut self, ui: &mut Ui, size: f32, alpha: f32, mut color: Color) {
-        let gl = unsafe { get_internal_gl() };
-        let ctx = gl.quad_context;
-        // Update cache when pass/texture actually changes
-        let current_texture = self.pass.texture(ctx);
-        if self.cached_texture.as_ref() != Some(&current_texture) {
-            self.cached_texture = Some(current_texture.clone());
-        }
-        if self.cached_pass.as_ref() != Some(&self.pass) {
-            self.cached_pass = Some(self.pass.clone());
-        }
-        if self.cleared {
-            if let Some(ref pass) = self.cached_pass {
-                gl.quad_gl.render_pass(Some(pass.clone()));
-            }
-            gl.quad_gl.viewport(Some(self.viewport));
-        }
-        let new_alpha = alpha.max(0.0) * 2.55;
-        if self.last_color_alpha != new_alpha {
-            color.a = new_alpha;
-            self.last_color_alpha = new_alpha;
-        }
-        if size != self.last_size {
-            self.last_size = size;
-        }
-        if size <= 0.0 {
-            if !self.cleared {
-                clear_background(Color::default());
-                self.cleared = true;
-            }
-        } else {
-            let radius = size / self.viewport.2 as f32 * 2.0;
-            ui.fill_circle(0., 0., radius, color);
-            self.cleared = true;
-        }
-        if let Some(ref pass) = self.cached_pass {
-            gl.quad_gl.render_pass(Some(pass.clone()));
-        }
-        gl.quad_gl.viewport(Some(self.viewport));
-    }
 }
 
 impl JudgeLine {
@@ -391,90 +294,68 @@ impl JudgeLine {
             }
             true
         });
-        //if res.config.hand_split {
-        //    let config = Config::default();
-        //    let rot = self.object.rotation.now();
-        //    assign_hands(&mut self.notes, &config, index, rot, bpm_list);
-        //}
     }
 
-    pub fn update_hand_assign_with_world_pos(&mut self, res: &mut Resource, world_pos: Vector, bpm_list: &BpmList, index: usize) {
+    pub fn update_hand_assign_with_world_pos(&mut self, res: &mut Resource, world_pos: Vector, index: usize) {
         if !res.config.hand_split || self.notes.is_empty() {
             return;
         }
-        
-        let config = crate::config::Config::default();
+
+        let config = &res.config;
         let rot = self.object.rotation.now();
+        let time = res.time;
         let line_translation = world_pos;
-        
+
         let chart_ratio_inv = res.chart_ratio_inv;
         let vw = 1.2 * chart_ratio_inv;
         let vh = chart_ratio_inv;
 
         ENHANCED_NOTES_BUFFER.with(|buffer| {
-            let mut enhanced_notes_data = buffer.borrow_mut();
-            enhanced_notes_data.clear();
-            enhanced_notes_data.reserve(self.notes.len());
-            
+            let mut positions = buffer.borrow_mut();
+            positions.clear();
+            positions.reserve(self.notes.len());
+
             for note in &self.notes {
                 let local_x = note.object.translation.0.now();
                 let local_y = note.object.translation.1.now();
-                let world_x_no_rotation = local_x * vw;
-                let world_y_no_rotation = local_y * vh;
-                let world_x = world_x_no_rotation + line_translation.x;
-                let world_y = world_y_no_rotation + line_translation.y;
-                let true_world_pos = Vector::new(world_x, world_y);
-                let enhanced_pos = true_world_pos;
-                
-                enhanced_notes_data.push((true_world_pos, enhanced_pos));
+                positions.push(Vector::new(
+                    local_x * vw + line_translation.x,
+                    local_y * vh + line_translation.y,
+                ));
             }
-            AI_NOTES_BUFFER.with(|ai_buffer| {
-                let mut ai_notes = ai_buffer.borrow_mut();
-                ai_notes.clear();
-                ai_notes.reserve(self.notes.len());
-                
-                for (note, &(_true_world_pos, enhanced_pos)) in self.notes.iter().zip(enhanced_notes_data.iter()) {
-                    let ai_note = crate::core::Note {
-                        time: note.time,
-                        kind: note.kind.clone(),
-                        height: note.height,
-                        object: crate::core::Object {
-                            alpha: crate::core::AnimFloat::default(),
-                            scale: crate::core::AnimVector(crate::core::AnimFloat::fixed(1.0), crate::core::AnimFloat::fixed(1.0)),
-                            rotation: crate::core::AnimFloat::default(),
-                            translation: crate::core::AnimVector(
-                                crate::core::AnimFloat::fixed(enhanced_pos.x),
-                                crate::core::AnimFloat::fixed(enhanced_pos.y),
-                            ),
-                        },
-                        speed: note.speed,
-                        end_speed: note.end_speed,
-                        start_height: note.start_height,
-                        hand: note.hand,
-                        above: note.above,
-                        multiple_hint: note.multiple_hint,
-                        fake: note.fake,
-                        judge: note.judge.clone(),
-                        format: note.format,
-                    };
-                    ai_notes.push(ai_note);
-                }
-                crate::hand::assign_hands_unified_perspective(&mut ai_notes, &config, index, rot, bpm_list, &enhanced_notes_data);
-                for (orig_note, ai_note) in self.notes.iter_mut().zip(ai_notes.iter()) {
-                    orig_note.hand = ai_note.hand;
-                }
-            });
+
+            crate::hand::assign_hands_unified_perspective(
+                &mut self.notes,
+                config,
+                index,
+                rot,
+                time,
+                &positions,
+                || {
+                    res.chart_target.as_ref()
+                        .map(|t| t.read_pixels_resized(crate::hand::AI_IMAGE_W, crate::hand::AI_IMAGE_H))
+                        .unwrap_or_else(|| vec![0.0; crate::hand::AI_IMAGE_SIZE])
+                },
+            );
         });
     }
 
     pub fn fetch_pos(line: &JudgeLine, res: &Resource, lines: &[JudgeLine]) -> Vector {
+        // Positions computed during `Chart::update` this frame are reused, so a deep
+        // parent chain costs O(depth) only on the first hit instead of per line.
         if let Some(parent) = line.parent {
             let parent = &lines[parent];
-            let mut parent_translation = Self::fetch_pos(parent, res, lines);
+            let mut parent_translation = match parent.cached_world_pos {
+                Some(pos) => pos,
+                None => Self::fetch_pos(parent, res, lines),
+            };
             parent_translation += Rotation2::new(parent.object.rotation.now().to_radians()) * line.object.now_translation(res);
             return parent_translation;
         }
-        line.object.now_translation(res)
+        match line.cached_world_pos {
+            Some(pos) => pos,
+            None => line.object.now_translation(res),
+        }
     }
 
 
@@ -486,7 +367,7 @@ impl JudgeLine {
         self.object.now_rotation().append_translation(&world_pos)
     }
 
-    pub fn render(&self, mut ui: &mut Ui, res: &mut Resource, lines: &[JudgeLine], bpm_list: &BpmList, settings: &ChartSettings, id: usize) {
+    pub fn render(&self, ui: &mut Ui, res: &mut Resource, lines: &[JudgeLine], bpm_list: &BpmList, settings: &ChartSettings, id: usize) {
         let alpha = self.object.alpha.now_opt().unwrap_or(1.0) * res.alpha;
         let color = self.color.now_opt();
         let final_alpha = alpha.max(0.0);
@@ -518,43 +399,18 @@ impl JudgeLine {
                             }
                         }
                         JudgeLineKind::Texture(texture, _) => {
-                            if final_alpha == 0.0 && !is_debug {
-                                return;
-                            }
-
+                            if final_alpha == 0.0 && !is_debug { return; }
                             let mut tex_color = color.unwrap_or(WHITE);
-                            if res.time <= 0. && tex_color == WHITE {
-                                tex_color = BLACK;
-                            }
-
+                            if res.time <= 0. && tex_color == WHITE { tex_color = BLACK; }
                             tex_color.a = if is_debug {
                                 0.10 + 0.90 * final_alpha
                             } else {
                                 final_alpha
                             };
-                            let key = texture.get_tex() as *const Texture2D as usize;
-                            let texture_2d = {
-                                if let Ok(cache) = TEXTURE_CACHE.try_read() {
-                                    if let Some(tex) = cache.get(&key) {
-                                        tex.clone()
-                                    } else {
-                                        drop(cache);
-                                        TEXTURE_CACHE.write().unwrap()
-                                            .entry(key)
-                                            .or_insert_with(|| texture.get_tex().clone())
-                                            .clone()
-                                    }
-                                } else {
-                                    let cache = TEXTURE_CACHE.read().unwrap();
-                                    cache.get(&key).cloned().unwrap_or_else(|| {
-                                        drop(cache);
-                                        TEXTURE_CACHE.write().unwrap()
-                                            .entry(key)
-                                            .or_insert_with(|| texture.get_tex().clone())
-                                            .clone()
-                                    })
-                                }
-                            };
+                            // `SafeTexture::get_tex()` is just an `Arc` deref and the
+                            // handle is `Copy`, so a lock + hashmap lookup would only
+                            // add overhead here.
+                            let texture_2d = *texture.get_tex();
 
                             let hf = vec2(texture_2d.width(), texture_2d.height());
                             draw_texture_ex(
@@ -608,38 +464,77 @@ impl JudgeLine {
                                 draw_text_aligned(ui, &now, 0., 0., (0.5, 0.5), 1., final_color);
                             });
                         }
-                        JudgeLineKind::Paint(anim, _state) => {
+                        JudgeLineKind::Paint(anim, state) => {
                             let size = anim.now();
-                            let paint_color = color.unwrap_or(WHITE);
-                            // Lazy Painter creation - only allocated for Paint lines
-                            let mut painter = Painter::new();
-                            painter.paint(&mut ui, size, alpha, paint_color);
+                            if size <= 0.0 || final_alpha == 0.0 {
+                                // Nothing visible this frame; the blit below is skipped too.
+                                state.lock().unwrap().1 = false;
+                            } else {
+                                let mut paint_color = color.unwrap_or(WHITE);
+                                paint_color.a = final_alpha * 2.55;
+                                let vp = get_viewport();
+                                let pass = {
+                                    let mut guard = state.lock().unwrap();
+                                    if guard.0.is_none() {
+                                        let gl = unsafe { get_internal_gl() };
+                                        let tex = Texture::new_render_texture(
+                                            gl.quad_context,
+                                            TextureParams {
+                                                width: vp.2 as _,
+                                                height: vp.3 as _,
+                                                format: TextureFormat::RGBA8,
+                                                filter: FilterMode::Linear,
+                                                wrap: TextureWrap::Clamp,
+                                            },
+                                        );
+                                        guard.0 = Some(RenderPass::new(gl.quad_context, tex, None));
+                                    }
+                                    guard.0.unwrap()
+                                };
+                                let (old_pass, old_vp) = {
+                                    let gl = unsafe { get_internal_gl() };
+                                    // Clear the offscreen target through a raw pass:
+                                    // `clear_background` would additionally throw away every
+                                    // vertex QuadGl has batched for this frame.
+                                    gl.quad_context.begin_pass(pass, PassAction::clear_color(0., 0., 0., 0.));
+                                    gl.quad_context.end_render_pass();
+                                    let old_pass = gl.quad_gl.get_active_render_pass();
+                                    let old_vp = gl.quad_gl.get_viewport();
+                                    gl.quad_gl.render_pass(Some(pass));
+                                    gl.quad_gl.viewport(None);
+                                    (old_pass, old_vp)
+                                };
+                                ui.fill_circle(0., 0., size / vp.2 as f32 * 2., paint_color);
+                                {
+                                    let gl = unsafe { get_internal_gl() };
+                                    gl.quad_gl.render_pass(old_pass);
+                                    gl.quad_gl.viewport(old_vp);
+                                }
+                                state.lock().unwrap().1 = true;
+                            }
                         }
                     }
                 })
             });
             if let JudgeLineKind::Paint(_, state) = &self.kind {
-                let gl = unsafe { get_internal_gl() };
-                let ctx = gl.quad_context;
-
                 let guard = state.lock().unwrap();
                 let ready = guard.1;
-
-                if ready {
-                    if let Some(pass) = guard.0.as_ref() {
-                        let tex = pass.texture(ctx);
-                        let top = res.inv_aspect_ratio;
-                        draw_texture_ex(
-                            Texture2D::from_miniquad_texture(tex),
-                            -1.,
-                            -top,
-                            WHITE,
-                            DrawTextureParams {
-                                dest_size: Some(vec2(2., top * 2.)),
-                                ..Default::default()
-                            },
-                        );
-                    }
+                let tex = ready
+                    .then(|| guard.0.as_ref().map(|it| it.texture(unsafe { get_internal_gl() }.quad_context)))
+                    .flatten();
+                drop(guard);
+                if let Some(tex) = tex {
+                    let top = res.inv_aspect_ratio;
+                    draw_texture_ex(
+                        Texture2D::from_miniquad_texture(tex),
+                        -1.,
+                        -top,
+                        WHITE,
+                        DrawTextureParams {
+                            dest_size: Some(vec2(2., top * 2.)),
+                            ..Default::default()
+                        },
+                    );
                 }
             }
 
@@ -673,53 +568,51 @@ impl JudgeLine {
             let chart_ratio_inv = res.chart_ratio_inv; // 使用缓存的值
             let vw = 1.2 * chart_ratio_inv;
             let vh = chart_ratio_inv;
-            // 相机可见范围(最终世界坐标系),用于判断 note 是否在屏幕外(上/下/左/右)
-            let half_w = chart_ratio_inv;
-            let half_h = chart_ratio_inv * res.inv_aspect_ratio;
-
-            // Use cached viewport corner world positions to avoid repeated matrix inverse calls.
-            // The cache is invalidated when the viewport changes.
-            let viewport = get_viewport();
-            let viewport_points = {
-                let mut cache = VIEWPORT_CACHE.lock().unwrap();
-                if cache.0 == Some(viewport) {
-                    cache.1.unwrap()
-                } else {
-                    let points = [
-                        res.screen_to_world(Point::new(-vw, -vh)),
-                        res.screen_to_world(Point::new(-vw, vh)),
-                        res.screen_to_world(Point::new(vw, -vh)),
-                        res.screen_to_world(Point::new(vw, vh)),
-                    ];
-                    cache.0 = Some(viewport);
-                    cache.1 = Some(points);
-                    points
-                }
-            };
 
             let inv_aspect_ratio = res.inv_aspect_ratio; // 使用缓存的值
-            let height_above = viewport_points.iter()
-                .map(|p| p.y)
-                .fold(f32::NEG_INFINITY, f32::max) * (1.0 / inv_aspect_ratio);
-
-            let height_below = viewport_points.iter()
-                .map(|p| p.y)
-                .fold(f32::INFINITY, f32::min) * (1.0 / inv_aspect_ratio);
-
             let agg = res.config.aggressive;
             let chart_format_matches = matches!(res.chart_format, ChartFormat::Pgr | ChartFormat::Rpe);
             let note_scale_positive = res.config.note_scale > 0.;
 
             if !note_scale_positive { return; }
+
+            // Viewport corners expressed in *this* judge line's local space, because
+            // the aggressive culling below compares them against line-local note
+            // heights. The corners therefore depend on this line's transform and must
+            // not be cached globally across judge lines (the old cache was keyed only
+            // by viewport, so every line except the first reused another line's bounds).
+            // Only the aggressive path reads them, so skip the matrix inverse entirely
+            // when aggressive culling is off.
+            let (height_above, height_below) = if agg {
+                let inv = (res.model() * transform)
+                    .try_inverse()
+                    .unwrap_or_else(Matrix::identity);
+                let viewport_points = [
+                    inv.transform_point(&Point::new(-vw, -vh)),
+                    inv.transform_point(&Point::new(-vw, vh)),
+                    inv.transform_point(&Point::new(vw, -vh)),
+                    inv.transform_point(&Point::new(vw, vh)),
+                ];
+                let above = viewport_points.iter()
+                    .map(|p| p.y)
+                    .fold(f32::NEG_INFINITY, f32::max) * (1.0 / inv_aspect_ratio);
+                let below = viewport_points.iter()
+                    .map(|p| p.y)
+                    .fold(f32::INFINITY, f32::min) * (1.0 / inv_aspect_ratio);
+                (above, below)
+            } else {
+                (0.0, 0.0)
+            };
+
             // Use a lightweight view that borrows keyframes instead of cloning the entire AnimFloat
             let mut height = AnimFloatView::new(&self.height);
             let not_plain_count = self.cache.not_plain_count;
 
             for note in self.notes[..not_plain_count].iter().filter(|n| n.above) {
-                height.set_time(note.time.min(res.time));
-                let line_height_at_note = height.now();
-                let note_height = note.height - line_height_at_note + note.object.translation.1.now();
                 if agg && chart_format_matches {
+                    height.set_time(note.time.min(res.time));
+                    let line_height_at_note = height.now();
+                    let note_height = note.height - line_height_at_note + note.object.translation.1.now();
                     let inv_speed = 1.0 / note.speed;
                     if note_height < height_below * inv_speed { continue; }
                     if note_height > height_above * inv_speed { break; }
@@ -735,20 +628,21 @@ impl JudgeLine {
 
                 for note in &self.notes[index..] {
                     if !note.above || speed != note.speed { break; }
-                    let note_height = note.height - config.line_height + note.object.translation.1.now();
-                    if agg && note_height < height_below_scaled { continue; }
-                    if agg && note_height > height_above_scaled { break; }
+                    if agg {
+                        let note_height = note.height - config.line_height + note.object.translation.1.now();
+                        if note_height < height_below_scaled { continue; }
+                        if note_height > height_above_scaled { break; }
+                    }
                     note.render(res, &mut config, bpm_list);
                 }
             }
 
             res.with_model(*FLIP_Y_MATRIX, |res| {
                 for note in self.notes[..not_plain_count].iter().filter(|n| !n.above) {
-                    height.set_time(note.time.min(res.time));
-                    let line_height_at_note = height.now();
-                    let note_height = note.height - line_height_at_note + note.object.translation.1.now();
-
                     if agg && chart_format_matches {
+                        height.set_time(note.time.min(res.time));
+                        let line_height_at_note = height.now();
+                        let note_height = note.height - line_height_at_note + note.object.translation.1.now();
                         let inv_speed = 1.0 / note.speed;
                         if note_height < -height_above * inv_speed {
                             continue;
@@ -773,13 +667,14 @@ impl JudgeLine {
                             break;
                         }
 
-                        let note_height = note.height - config.line_height + note.object.translation.1.now();
-
-                        if agg && note_height < neg_height_above_scaled {
-                            continue;
-                        }
-                        if agg && note_height > neg_height_below_scaled {
-                            break;
+                        if agg {
+                            let note_height = note.height - config.line_height + note.object.translation.1.now();
+                            if note_height < neg_height_above_scaled {
+                                continue;
+                            }
+                            if note_height > neg_height_below_scaled {
+                                break;
+                            }
                         }
 
                         note.render(res, &mut config, bpm_list);

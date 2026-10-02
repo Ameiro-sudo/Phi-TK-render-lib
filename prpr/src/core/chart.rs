@@ -117,9 +117,17 @@ impl Chart {
     }
 
     pub fn update(&mut self, res: &mut Resource) {
-        //TODO: 优化
+        // All judge lines share a single full-frame GPU readback per update.
+        crate::core::begin_readback_cycle();
+
+        // `Anim::set_time` 内部已按二分定位关键帧，父线的世界坐标也由下面的
+        // `fetch_pos` 按帧记忆化，这一段的每帧开销已是 O(判定线数)。
         for line in &mut self.lines {
             line.object.set_time(res.time);
+            // Drop the previous frame's position *before* recomputing: a parent whose
+            // index is greater than its child's would otherwise be resolved from a
+            // stale value. `fetch_pos` then memoizes parents already computed this frame.
+            line.cached_world_pos = None;
         }
 
         let count = self.lines.len();
@@ -137,10 +145,9 @@ impl Chart {
             line.update(res, self.trs[index], &guard, index);
 
             if res.config.hand_split {
-                line.update_hand_assign_with_world_pos(res, self.world_positions[index], &guard, index);
+                line.update_hand_assign_with_world_pos(res, self.world_positions[index], index);
             }
         }
-        self.trs.clear();
         drop(guard);
 
         for effect in &mut self.extra.effects {

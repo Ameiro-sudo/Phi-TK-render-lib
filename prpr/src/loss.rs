@@ -1,72 +1,99 @@
 use crate::core::note::{Hand, Note, NoteKind};
 use crate::core::Chart;
+use crate::hand_model::{ErgonomicHandSystem, Vector2};
 use crate::judge::{Judgement, PlayResult, LIMIT_BAD, LIMIT_GOOD, LIMIT_PERFECT};
 
-#[inline]
-pub fn judgement_penalty(j: Judgement) -> f32 {
-    match j {
+pub fn judgement_penalty(judgement: Judgement) -> f32 {
+    match judgement {
         Judgement::Perfect => 0.0,
-        Judgement::Good    => 0.35,
-        Judgement::Bad     => 1.0,
-        Judgement::Miss    => 2.0,
+        Judgement::Good => 0.35,
+        Judgement::Bad => 1.0,
+        Judgement::Miss => 2.0,
     }
 }
 
-#[inline]
-pub fn note_loss(judgement: Judgement, dt: f32, hand_feasible: bool) -> f32 {
-    let penalty   = judgement_penalty(judgement);
-    let timing    = 0.5 * dt * dt;
-    let phys      = if hand_feasible { 0.0 } else { 5.0 };
-    penalty + timing + phys
+pub fn note_loss(judgement: Judgement, time_error: f32, hand_feasible: bool) -> f32 {
+    let timing = 0.5 * time_error * time_error;
+    let physical = if hand_feasible { 0.0 } else { 5.0 };
+    judgement_penalty(judgement) + timing + physical
+}
+
+/// Turns physical-model errors into a judgement. The timing limits are shared
+/// with `judge.rs`, so the model is graded exactly like a player.
+pub fn judgement_from_errors(
+    success: bool,
+    position_error: f32,
+    time_error: f32,
+    kind: &NoteKind,
+) -> Judgement {
+    let judgement = if !success {
+        Judgement::Miss
+    } else if time_error <= LIMIT_PERFECT && position_error <= 0.1 {
+        Judgement::Perfect
+    } else if time_error <= LIMIT_GOOD {
+        Judgement::Good
+    } else if time_error <= LIMIT_BAD {
+        Judgement::Bad
+    } else {
+        Judgement::Miss
+    };
+    match kind {
+        NoteKind::Flick | NoteKind::Drag if matches!(judgement, Judgement::Bad) => Judgement::Good,
+        _ => judgement,
+    }
 }
 
 pub fn chart_loss(result: &PlayResult, feasible_flags: &[bool]) -> f32 {
-    let n = result.num_of_notes.max(1) as f32;
+    let notes = result.num_of_notes.max(1) as f32;
     let accuracy_loss = (1.0 - result.accuracy as f32).max(0.0);
-    let miss_rate = result.counts[Judgement::Miss as usize] as f32 / n;
+    let miss_rate = result.counts[Judgement::Miss as usize] as f32 / notes;
 
-    let early = result.early as f32;
-    let late  = result.late  as f32;
     let timing_variance = if result.num_of_notes > 0 {
-        let imbalance = ((early - late) / n).powi(2);
-        imbalance
-    } else { 0.0 };
+        let imbalance = (result.early as f32 - result.late as f32) / notes;
+        imbalance * imbalance
+    } else {
+        0.0
+    };
 
     let combo_loss = if result.num_of_notes > 0 {
-        1.0 - (result.max_combo as f32 / n).min(1.0)
-    } else { 0.0 };
+        1.0 - (result.max_combo as f32 / notes).min(1.0)
+    } else {
+        0.0
+    };
 
     let infeasible_rate = if feasible_flags.is_empty() {
         0.0
     } else {
-        let bad = feasible_flags.iter().filter(|&&ok| !ok).count() as f32;
-        bad / feasible_flags.len() as f32
+        let infeasible = feasible_flags.iter().filter(|&&ok| !ok).count() as f32;
+        infeasible / feasible_flags.len() as f32
     };
 
-    const KAPPA: f32 = 1.5;
-    const TAU:   f32 = 0.3;
-    const GAMMA: f32 = 0.4;
-    const ETA:   f32 = 2.0;
+    const MISS_WEIGHT: f32 = 1.5;
+    const TIMING_WEIGHT: f32 = 0.3;
+    const COMBO_WEIGHT: f32 = 0.4;
+    const INFEASIBLE_WEIGHT: f32 = 2.0;
 
     accuracy_loss
-        + KAPPA * miss_rate
-        + TAU   * timing_variance
-        + GAMMA * combo_loss
-        + ETA   * infeasible_rate
+        + MISS_WEIGHT * miss_rate
+        + TIMING_WEIGHT * timing_variance
+        + COMBO_WEIGHT * combo_loss
+        + INFEASIBLE_WEIGHT * infeasible_rate
 }
 
 pub fn chart_loss_from_counts(counts: [u32; 4], max_combo: u32, total: u32) -> f32 {
-    if total == 0 { return 0.0; }
-    let n = total as f32;
+    if total == 0 {
+        return 0.0;
+    }
+    let notes = total as f32;
     let perfect = counts[Judgement::Perfect as usize] as f32;
-    let good    = counts[Judgement::Good    as usize] as f32;
-    let bad     = counts[Judgement::Bad     as usize] as f32;
-    let miss    = counts[Judgement::Miss    as usize] as f32;
+    let good = counts[Judgement::Good as usize] as f32;
+    let bad = counts[Judgement::Bad as usize] as f32;
+    let miss = counts[Judgement::Miss as usize] as f32;
 
-    let accuracy = (perfect + 0.65 * good) / n;
-    let miss_rate = miss / n;
-    let combo_loss = 1.0 - (max_combo as f32 / n).min(1.0);
-    let bad_rate = bad / n;
+    let accuracy = (perfect + 0.65 * good) / notes;
+    let miss_rate = miss / notes;
+    let bad_rate = bad / notes;
+    let combo_loss = 1.0 - (max_combo as f32 / notes).min(1.0);
 
     (1.0 - accuracy) + 1.5 * miss_rate + 0.4 * combo_loss + 0.8 * bad_rate
 }
@@ -74,44 +101,22 @@ pub fn chart_loss_from_counts(counts: [u32; 4], max_combo: u32, total: u32) -> f
 pub fn simulate_note_outcome(
     note: &Note,
     hand: Hand,
-    hand_system: &crate::hand_model::ErgonomicHandSystem,
+    hand_system: &ErgonomicHandSystem,
     note_world_x: f32,
     current_time: f32,
 ) -> (Judgement, f32, bool) {
-    let pos = crate::hand_model::Vector2::new(note_world_x, 0.0);
-    let (success, pos_err, time_err, _conf) =
-        hand_system.evaluate_note_success(hand, &pos, note.time, current_time, &note.kind);
-
-    let dt = time_err; // 秒
-
-    let judgement = if !success {
-        // 手模型认为根本打不到 → Miss
-        Judgement::Miss
-    } else if dt <= LIMIT_PERFECT && pos_err <= 0.1 {
-        Judgement::Perfect
-    } else if dt <= LIMIT_GOOD {
-        Judgement::Good
-    } else if dt <= LIMIT_BAD {
-        Judgement::Bad
-    } else {
-        Judgement::Miss
-    };
-
-    let judgement = match note.kind {
-        NoteKind::Flick | NoteKind::Drag if matches!(judgement, Judgement::Bad) => {
-            Judgement::Good
-        }
-        _ => judgement,
-    };
-
-    let feasible = success || dt <= LIMIT_BAD;
-    (judgement, dt, feasible)
+    let position = Vector2::new(note_world_x, 0.0);
+    let (success, position_error, time_error, _) =
+        hand_system.evaluate_note_success(hand, &position, note.time, current_time, &note.kind);
+    let judgement = judgement_from_errors(success, position_error, time_error, &note.kind);
+    let feasible = success || time_error <= LIMIT_BAD;
+    (judgement, time_error, feasible)
 }
 
 pub fn evaluate_assignments(
     chart: &Chart,
     assignments: &[Hand],
-    hand_system: &crate::hand_model::ErgonomicHandSystem,
+    hand_system: &ErgonomicHandSystem,
 ) -> (Vec<f32>, f32) {
     let mut per_note = Vec::with_capacity(assignments.len());
     let mut counts = [0u32; 4];
@@ -120,41 +125,43 @@ pub fn evaluate_assignments(
     let mut total = 0u32;
     let mut feasible_flags = Vec::with_capacity(assignments.len());
 
-    let mut idx = 0;
+    let mut index = 0;
     for line in &chart.lines {
         for note in &line.notes {
-            if note.fake { continue; }
-            if idx >= assignments.len() { break; }
+            if note.fake {
+                continue;
+            }
+            if index >= assignments.len() {
+                break;
+            }
 
-            let hand = assignments[idx];
-            // 用 note 的 translation.x 作为世界坐标近似
             let world_x = note.object.translation.0.now_opt().unwrap_or(0.0);
-            let (j, dt, feasible) =
-                simulate_note_outcome(note, hand, hand_system, world_x, note.time);
+            let (judgement, time_error, feasible) =
+                simulate_note_outcome(note, assignments[index], hand_system, world_x, note.time);
 
-            per_note.push(note_loss(j, dt, feasible));
+            per_note.push(note_loss(judgement, time_error, feasible));
             feasible_flags.push(feasible);
-            counts[j as usize] += 1;
+            counts[judgement as usize] += 1;
             total += 1;
-            match j {
+            match judgement {
                 Judgement::Perfect | Judgement::Good => {
                     combo += 1;
-                    if combo > max_combo { max_combo = combo; }
+                    if combo > max_combo {
+                        max_combo = combo;
+                    }
                 }
                 _ => combo = 0,
             }
-            idx += 1;
+            index += 1;
         }
     }
 
-    let aggregated = chart_loss_from_counts(counts, max_combo, total)
-        + if feasible_flags.is_empty() { 0.0 }
-          else {
-              let bad = feasible_flags.iter().filter(|&&ok| !ok).count() as f32;
-              2.0 * bad / feasible_flags.len() as f32
-          };
-
-    (per_note, aggregated)
+    let infeasible = if feasible_flags.is_empty() {
+        0.0
+    } else {
+        2.0 * feasible_flags.iter().filter(|&&ok| !ok).count() as f32 / feasible_flags.len() as f32
+    };
+    (per_note, chart_loss_from_counts(counts, max_combo, total) + infeasible)
 }
 
 #[cfg(test)]
@@ -168,41 +175,40 @@ mod tests {
 
     #[test]
     fn miss_is_heaviest() {
-        let p = note_loss(Judgement::Perfect, 0.0, true);
-        let g = note_loss(Judgement::Good,    0.0, true);
-        let b = note_loss(Judgement::Bad,     0.0, true);
-        let m = note_loss(Judgement::Miss,    0.0, true);
-        assert!(p < g && g < b && b < m);
+        let perfect = note_loss(Judgement::Perfect, 0.0, true);
+        let good = note_loss(Judgement::Good, 0.0, true);
+        let bad = note_loss(Judgement::Bad, 0.0, true);
+        let miss = note_loss(Judgement::Miss, 0.0, true);
+        assert!(perfect < good && good < bad && bad < miss);
     }
 
     #[test]
     fn infeasible_hand_heavily_penalized() {
-        let ok  = note_loss(Judgement::Perfect, 0.0, true);
-        let bad = note_loss(Judgement::Perfect, 0.0, false);
-        assert!(bad - ok >= 4.9);
+        let reachable = note_loss(Judgement::Perfect, 0.0, true);
+        let unreachable = note_loss(Judgement::Perfect, 0.0, false);
+        assert!(unreachable - reachable >= 4.9);
     }
 
     #[test]
     fn chart_loss_full_perfect_is_zero() {
-        let r = PlayResult {
+        let result = PlayResult {
             score: 1_000_000,
             accuracy: 1.0,
             max_combo: 100,
             num_of_notes: 100,
             counts: [100, 0, 0, 0],
-            early: 50, late: 50,
+            early: 50,
+            late: 50,
             std: 0.0,
         };
         let flags = vec![true; 100];
-        let l = chart_loss(&r, &flags);
-        assert!(l.abs() < 1e-6, "full perfect should be 0 loss, got {}", l);
+        let loss = chart_loss(&result, &flags);
+        assert!(loss.abs() < 1e-6, "full perfect should be 0 loss, got {loss}");
     }
 
     #[test]
     fn chart_loss_counts_api() {
-        let l = chart_loss_from_counts([100, 0, 0, 0], 100, 100);
-        assert_eq!(l, 0.0);
-        let l2 = chart_loss_from_counts([0, 0, 0, 100], 0, 100);
-        assert!(l2 > 2.0);
+        assert_eq!(chart_loss_from_counts([100, 0, 0, 0], 100, 100), 0.0);
+        assert!(chart_loss_from_counts([0, 0, 0, 100], 0, 100) > 2.0);
     }
 }

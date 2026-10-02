@@ -8,8 +8,6 @@ use serde::Serialize;
 use serde::Deserialize;
 use macroquad::prelude::*;
 use macroquad::miniquad::gl::GLuint;
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use once_cell::sync::Lazy;
 
@@ -30,20 +28,11 @@ static HAND_COLORS: Lazy<[Color; 2]> = Lazy::new(|| [
     Color::new(1.0, 0.6, 0.7, 1.0),  // Right
 ]);
 
-// Cache texture GL internal IDs by raw pointer to avoid repeated FFI calls
-thread_local! {
-    static TEXTURE_GL_CACHE: RefCell<HashMap<u32, GLuint>> = RefCell::new(HashMap::new());
-}
-
+// Texture GL internal id is a plain field read (`miniquad::Texture::gl_internal_id`
+// returns `self.texture`), so no caching layer is needed here.
 #[inline(always)]
-fn get_texture_gl_id(texture: &Texture2D) -> GLuint {
-    let tex = texture.raw_miniquad_texture_handle();
-    let key = tex.gl_internal_id();
-    TEXTURE_GL_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let id = *cache.entry(key).or_insert(key);
-        id
-    })
+fn texture_gl_id(texture: &Texture2D) -> GLuint {
+    texture.raw_miniquad_texture_handle().gl_internal_id()
 }
 
 
@@ -159,7 +148,8 @@ fn draw_tex(res: &Resource, texture: Texture2D, order: i8, x: f32, y: f32, color
 
 #[inline(always)]
 fn draw_tex_pts(res: &Resource, texture: Texture2D, order: i8, p: [Point; 4], color: Color, params: DrawTextureParams) {
-    let p_screen = p.map(|pt| res.world_to_screen(pt));
+    let model = res.model();
+    let p_screen = p.map(|pt| model.transform_point(&pt));
 
     let (min_x, max_x, min_y, max_y) = p_screen.iter().fold(
         (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
@@ -199,7 +189,7 @@ fn draw_tex_pts(res: &Resource, texture: Texture2D, order: i8, p: [Point; 4], co
     ];
 
     res.note_buffer.borrow_mut().push(
-        (order, get_texture_gl_id(&texture)),
+        (order, texture_gl_id(&texture)),
         vertices
     );
 }
@@ -450,11 +440,12 @@ impl Note {
                 style.hold_body_rect()
             };
 
-            // Compute transform once for all hold parts
-            let transform = self.now_transform(res, &config.ctrl_obj, 0., config.incline_sin);
+            // Compute the final (line model * note transform) matrix once for all
+            // hold parts, so each part only needs 4 point transforms instead of 8.
+            let model = res.model() * self.now_transform(res, &config.ctrl_obj, 0., config.incline_sin);
 
             self.render_quad_raw(
-                res, config, &transform, scale, color, order,
+                res, config, &model, scale, color, order,
                 **body_tex, body_source,
                 vec2(scale * 2., top - bottom), clip, bottom
             );
@@ -464,7 +455,7 @@ impl Note {
                 let hf = vec2(scale, r.h / r.w * scale * ratio);
                 let head_y = bottom - if res.res_pack.info.hold_compact { hf.y } else { hf.y * 2. };
                 self.render_quad_raw(
-                    res, config, &transform, scale, color, order,
+                    res, config, &model, scale, color, order,
                     **tex, r, hf * 2., clip, head_y
                 );
             }
@@ -473,7 +464,7 @@ impl Note {
             let hf = vec2(scale, r.h / r.w * scale * ratio);
             let tail_y = top - if res.res_pack.info.hold_compact { hf.y } else { 0. };
             self.render_quad_raw(
-                res, config, &transform, scale, color, order,
+                res, config, &model, scale, color, order,
                 **tex, r, hf * 2., clip, tail_y
             );
         }
@@ -483,16 +474,17 @@ impl Note {
     // 渲染居中 quad
     fn render_quad(&self, res: &Resource, config: &RenderConfig, base: f32, scale: f32, color: Color, order: i8, tex: Texture2D, source: Rect) {
         let hf = vec2(scale, tex.height() * scale / tex.width());
-        let transform = self.now_transform(res, &config.ctrl_obj, base, config.incline_sin);
-        self.render_quad_raw(res, config, &transform, scale, color, order, tex, source, hf * 2., false, -hf.y);
+        let model = res.model() * self.now_transform(res, &config.ctrl_obj, base, config.incline_sin);
+        self.render_quad_raw(res, config, &model, scale, color, order, tex, source, hf * 2., false, -hf.y);
     }
 
     // 底层 quad 提交
+    // `model` is the *combined* line-model * note-transform matrix (see `Resource::model`).
     fn render_quad_raw(
         &self,
         res: &Resource,
-        config: &RenderConfig,
-        transform: &Matrix,
+        _config: &RenderConfig,
+        model: &Matrix,
         scale: f32,
         color: Color,
         order: i8,
@@ -520,7 +512,6 @@ impl Note {
             final_source.h *= 1.0 - ratio;
         }
 
-        // Compute world positions using pre-computed transform
         let p = [
             Point::new(x, y),
             Point::new(x + w, y),
@@ -528,8 +519,9 @@ impl Note {
             Point::new(x, y + h),
         ];
 
-        let p_world = p.map(|pt| transform.transform_point(&pt));
-        let p_screen = p_world.map(|pt| res.world_to_screen(pt));
+        // Screen positions: one matrix application per point (the caller already
+        // folded in the line's model matrix, so no second transform is needed).
+        let p_screen = p.map(|pt| model.transform_point(&pt));
         let chart_ratio_inv = res.chart_ratio_inv; // 使用缓存的值
         let (min_x, max_x, min_y, max_y) = p_screen.iter().fold(
             (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
@@ -559,7 +551,7 @@ impl Note {
 
         // Submit to batch buffer
         res.note_buffer.borrow_mut().push(
-            (order, get_texture_gl_id(&tex)),
+            (order, texture_gl_id(&tex)),
             vertices
         );
     }

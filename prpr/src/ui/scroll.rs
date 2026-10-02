@@ -2,13 +2,17 @@ use super::Ui;
 use crate::core::{Matrix, Point, Vector};
 use macroquad::prelude::{Rect, Touch, TouchPhase, Vec2};
 use nalgebra::Translation2;
-use std::collections::VecDeque;
 
 const THRESHOLD: f32 = 0.03;
 const EXTEND: f32 = 0.33;
 
 pub struct VelocityTracker {
-    movements: VecDeque<(f32, Point)>,
+    // Fixed-capacity ring buffer. `RECORD_MAX` is small enough that a heap
+    // allocation per tracker (and a `pop_front` on every touch move) is pure
+    // overhead, so the samples live inline and pushing only bumps two indices.
+    buf: [(f32, Point); Self::RECORD_MAX],
+    len: usize,
+    start: usize,
 }
 
 impl VelocityTracker {
@@ -16,28 +20,45 @@ impl VelocityTracker {
 
     pub fn empty() -> Self {
         Self {
-            movements: VecDeque::with_capacity(Self::RECORD_MAX),
+            buf: [(0., Point::new(0., 0.)); Self::RECORD_MAX],
+            len: 0,
+            start: 0,
         }
     }
 
     pub fn reset(&mut self) {
-        self.movements.clear();
+        self.len = 0;
+        self.start = 0;
     }
 
     pub fn push(&mut self, time: f32, position: Point) {
-        if self.movements.len() == Self::RECORD_MAX {
-            // TODO optimize
-            self.movements.pop_front();
+        if self.len == Self::RECORD_MAX {
+            // Drop the oldest sample: its slot is exactly where the new one goes.
+            self.start = (self.start + 1) % Self::RECORD_MAX;
+        } else {
+            self.len += 1;
         }
-        self.movements.push_back((time, position));
+        let idx = (self.start + self.len - 1) % Self::RECORD_MAX;
+        self.buf[idx] = (time, position);
+    }
+
+    #[inline]
+    fn newest_time(&self) -> f32 {
+        debug_assert!(self.len > 0);
+        self.buf[(self.start + self.len - 1) % Self::RECORD_MAX].0
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &(f32, Point)> {
+        (0..self.len).map(move |i| &self.buf[(self.start + i) % Self::RECORD_MAX])
     }
 
     pub fn speed(&self) -> Vector {
-        if self.movements.is_empty() {
+        if self.len == 0 {
             return Vector::default();
         }
-        let n = self.movements.len() as f32;
-        let lst = self.movements.back().unwrap().0;
+        let n = self.len as f32;
+        let lst = self.newest_time();
         let mut sum_x = 0.;
         let mut sum_x2 = 0.;
         let mut sum_x3 = 0.;
@@ -45,7 +66,7 @@ impl VelocityTracker {
         let mut sum_y = Point::new(0., 0.);
         let mut sum_x_y = Point::new(0., 0.);
         let mut sum_x2_y = Point::new(0., 0.);
-        for (t, pt) in &self.movements {
+        for (t, pt) in self.iter() {
             let t = t - lst;
             let v = pt.coords;
             let mut w = t;

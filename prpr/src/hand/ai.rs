@@ -1,39 +1,48 @@
-use crate::config::Config;
-use crate::core::note::Hand;
-use crate::core::{BpmList, Note};
-use crate::hand_model::{ErgonomicHandSystem, FingerType, Vector2};
 use super::network::DeepNeuralNetwork;
-use super::vit::{go as vgo, V};
-use super::Experience;
+use super::vit::HandVisionTransformer;
+use super::{Experience, AI_IMAGE_SIZE, AI_IMAGE_W, MODEL_PATH};
+use crate::config::Config;
+use crate::core::note::{Hand, NoteKind};
+use crate::core::Note;
+use crate::hand_model::{ErgonomicHandSystem, FingerType, Vector2};
+use crate::judge::Judgement;
+use crate::loss;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 pub(crate) const CONSECUTIVE_LIMIT: usize = 3;
-pub(crate) const BUFFER_SIZE: usize = 256;
 pub(crate) const TRAIN_INTERVAL: u64 = 8;
 pub(crate) const GAE_GAMMA: f32 = 0.99;
 pub(crate) const GAE_LAMBDA: f32 = 0.95;
 pub(crate) const PPO_EPS: f32 = 0.2;
 pub(crate) const PPO_VF_COEF: f32 = 0.5;
 
+const BUFFER_SIZE: usize = 256;
+const MIN_SAMPLES: usize = 64;
+const SAMPLE_LIMIT: usize = 128;
+const SAVE_EVERY: u64 = 500;
+const EPS_DECAY: f32 = 0.999;
+const EPS_FLOOR: f32 = 0.03;
+
+/// Model files carry a header so a file written by an older layout is rejected
+/// instead of being misread as garbage weights.
+const MODEL_MAGIC: [u8; 8] = *b"PHITKAI\0";
+const MODEL_VERSION: u32 = 3;
+const MODEL_HEADER: usize = 12;
+
 pub type Finger = crate::hand_model::FingerType;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhiTKAdvancedAI {
-    /// Vision Transformer: frame + note layout -> L/R
-    pub(crate) v: V,
-    /// value/aux head (legacy PPO path; ViT drives decisions)
+    pub(crate) vision: HandVisionTransformer,
+    /// Column-wise value/policy head, trained by the background PPO trainer.
     pub(crate) net: DeepNeuralNetwork,
     pub(crate) hs: ErgonomicHandSystem,
     pub(crate) rotation: f32,
-    eps: f32,
     total: u64,
-    ncorrect: u64,
-    recent: VecDeque<(Hand, f32, f32)>,
-    buf: VecDeque<Experience>,
-    /// last rendered frame (HxWx3, row-major) — ViT input cache
+    buffer: VecDeque<Experience>,
     #[serde(default)]
     last_frame: Vec<f32>,
 }
@@ -42,45 +51,40 @@ pub struct PhiTKAdvancedAI {
 pub(crate) struct PNote {
     pub position: Vector2,
     pub time: f32,
-    pub kind: crate::core::NoteKind,
+    pub kind: NoteKind,
     pub hand: Option<Hand>,
-    pub ok: bool,
+    pub feasible: bool,
+    pub judgement: Judgement,
+    pub time_error: f32,
 }
 
-fn x_to_col(x: f32, w: usize) -> usize {
-    let c = ((x + 1.0) * 0.5 * w as f32) as isize;
-    c.clamp(0, w as isize - 1) as usize
+fn column_of(x: f32, width: usize) -> usize {
+    let column = ((x + 1.0) * 0.5 * width as f32) as isize;
+    column.clamp(0, width as isize - 1) as usize
 }
 
 impl PhiTKAdvancedAI {
     pub fn new(rotation: f32) -> Self {
         let mut ai = Self {
-            v: V::n(),
+            vision: HandVisionTransformer::new(),
             net: DeepNeuralNetwork::new(),
             hs: ErgonomicHandSystem::new(),
             rotation,
-            eps: 0.25,
             total: 0,
-            ncorrect: 0,
-            recent: VecDeque::with_capacity(100),
-            buf: VecDeque::with_capacity(BUFFER_SIZE),
-            last_frame: vec![0.0; super::AI_IMAGE_SIZE],
+            buffer: VecDeque::with_capacity(BUFFER_SIZE),
+            last_frame: vec![0.0; AI_IMAGE_SIZE],
         };
-        ai.v.wake();
-        ai.net.init_gpu_sync();
+        ai.vision.wake();
         ai
     }
 
-    pub fn load_or_create(filepath: &str, rotation: f32, _config: &Config) -> Self {
-        if let Ok(bytes) = fs::read(Path::new(filepath)) {
-            if let Ok(mut ai) = bincode::deserialize::<Self>(&bytes) {
-                if ai.validate() {
-                    ai.rotation = rotation;
-                    ai.update_hand_positions();
-                    ai.v.wake();
-                    ai.net.init_gpu_sync();
-                    return ai;
-                }
+    pub fn load_or_create(filepath: &str, rotation: f32) -> Self {
+        if let Some(mut ai) = read_model(filepath) {
+            if ai.validate() {
+                ai.rotation = rotation;
+                ai.update_hand_positions();
+                ai.vision.wake();
+                return ai;
             }
         }
         let ai = Self::new(rotation);
@@ -88,59 +92,59 @@ impl PhiTKAdvancedAI {
         ai
     }
 
-    pub(crate) fn init_gpu_support(&mut self) {
-        self.v.wake();
-        self.net.init_gpu_sync();
-    }
-
     fn validate(&self) -> bool {
-        self.v.val() && self.net.validate() && self.eps.is_finite()
+        self.vision.validate() && self.net.validate()
     }
 
     fn save(&self, filepath: &str) {
-        if let Ok(data) = bincode::serialize(self) {
-            let _ = fs::write(filepath, data);
-        }
+        let Ok(data) = bincode::serialize(self) else { return };
+        let mut file = Vec::with_capacity(MODEL_HEADER + data.len());
+        file.extend_from_slice(&MODEL_MAGIC);
+        file.extend_from_slice(&MODEL_VERSION.to_le_bytes());
+        file.extend_from_slice(&data);
+        let _ = fs::write(filepath, file);
     }
 
     pub(crate) fn update_hand_positions(&mut self) {
-        let r = self.rotation.to_radians();
-        let (c, s) = (r.cos(), r.sin());
-        self.hs.left_hand.position = Vector2::new(-0.3 * c, -0.3 * s);
-        self.hs.right_hand.position = Vector2::new(0.3 * c, 0.3 * s);
+        let radians = self.rotation.to_radians();
+        let (cos, sin) = (radians.cos(), radians.sin());
+        self.hs.left_hand.position = Vector2::new(-0.3 * cos, -0.3 * sin);
+        self.hs.right_hand.position = Vector2::new(0.3 * cos, 0.3 * sin);
     }
 
-    /// Primary entry: ViT scores the frame against each note, distribution
-    /// policy emits hands, physical model re-checks feasibility.
-    pub fn analyze_and_assign(
-        &mut self,
-        notes: &mut [Note],
-        config: &Config,
-        _bpm_list: &BpmList,
-        line_id: usize,
-        time: f32,
-        image_data: &[f32],
-    ) {
-        if notes.is_empty() {
-            return;
-        }
-        self.hs.update(time);
-        self.assign_vision(notes, image_data, line_id, time, config);
-    }
-
-    /// Worker-thread entry: same path as analyze_and_assign without Bpm.
+    /// Assign one hand per note from the frame, then fold the decision back into
+    /// the experience buffer.
     pub(crate) fn assign_frame(
         &mut self,
         notes: &mut [Note],
         image_data: &[f32],
-        line_id: usize,
         time: f32,
         config: &Config,
     ) {
         if notes.is_empty() {
             return;
         }
-        self.assign_vision(notes, image_data, line_id, time, config);
+        self.poll_trainer();
+        self.cache_frame(image_data);
+
+        self.hs.update(time);
+        let hands = self.vision.decide(&self.last_frame, notes);
+        self.vision.eps = (self.vision.eps * EPS_DECAY).max(EPS_FLOOR);
+
+        let mut processed = self.preprocess(notes);
+        self.apply_hands(&mut processed, &hands);
+        self.post_process(&mut processed);
+        self.update_physical(&mut processed, time);
+        self.apply(notes, &processed);
+
+        self.store_experience(&processed);
+        self.total += notes.len() as u64;
+        if self.total % TRAIN_INTERVAL == 0 {
+            self.train(config.hand_ai_epochs as usize, config.hand_ai_train_budget_ms as u64);
+        }
+        if self.total % SAVE_EVERY == 0 {
+            self.save(MODEL_PATH);
+        }
     }
 
     /// Adopt a network the background trainer finished, if any.
@@ -150,92 +154,40 @@ impl PhiTKAdvancedAI {
         }
     }
 
-    fn assign_vision(&mut self, notes: &mut [Note], image_data: &[f32], line_id: usize, time: f32, config: &Config) {
-        self.poll_trainer();
-
-        // cache frame for fallback paths
-        if image_data.len() >= super::AI_IMAGE_SIZE {
-            self.last_frame.clear();
-            self.last_frame
-                .extend_from_slice(&image_data[..super::AI_IMAGE_SIZE]);
-        } else {
-            self.last_frame.clear();
-            self.last_frame.extend_from_slice(image_data);
-            self.last_frame.resize(super::AI_IMAGE_SIZE, 0.0);
-        }
-
-        let mut img = self.last_frame.clone();
-        img.resize(super::AI_IMAGE_SIZE, 0.0);
-
-        // ViT: remember respack templates + attend frame -> per-note L/R
-        let hands = vgo(&self.v, &img, notes);
-
-        // decay exploration on ViT
-        self.v.eps = (self.v.eps * 0.999).max(0.03);
-        self.eps = self.v.eps;
-
-        let mut pn = self.preprocess(notes);
-        self.apply_hands(&mut pn, &hands, line_id, time);
-        self.post_process(&mut pn);
-        self.update_physical(&mut pn, time);
-        self.apply(notes, &pn);
-
-        self.store_exp(&img, &hands, notes);
-        self.total += notes.len() as u64;
-        if self.total % TRAIN_INTERVAL == 0 {
-            self.train(config.hand_ai_epochs as usize, config.hand_ai_train_budget_ms as u64);
-        }
-        if self.total % 500 == 0 {
-            self.save("phitk_ai_model.bin");
-        }
+    fn cache_frame(&mut self, image_data: &[f32]) {
+        self.last_frame.clear();
+        let available = image_data.len().min(AI_IMAGE_SIZE);
+        self.last_frame.extend_from_slice(&image_data[..available]);
+        self.last_frame.resize(AI_IMAGE_SIZE, 0.0);
     }
 
     fn preprocess(&self, notes: &[Note]) -> Vec<PNote> {
         notes
             .iter()
-            .map(|n| {
-                let pos = Vector2::new(
-                    n.object.translation.0.now(),
-                    n.object.translation.1.now(),
-                );
-                PNote {
-                    position: pos,
-                    time: n.time,
-                    kind: n.kind.clone(),
-                    hand: None,
-                    ok: false,
-                }
+            .map(|note| PNote {
+                position: Vector2::new(note.object.translation.0.now(), note.object.translation.1.now()),
+                time: note.time,
+                kind: note.kind.clone(),
+                hand: None,
+                feasible: false,
+                judgement: Judgement::Perfect,
+                time_error: 0.0,
             })
             .collect()
     }
 
-    fn apply_hands(&mut self, notes: &mut [PNote], hands: &[Hand], line_id: usize, time: f32) {
-        for (n, &h) in notes.iter_mut().zip(hands.iter()) {
-            n.hand = Some(h);
-            let conf = if h == self.ideal_hand(n.position) {
-                1.0
-            } else {
-                0.4
-            };
-            n.ok = conf > 0.5;
-            self.hs
-                .update_finger_state(h, FingerType::Index, n.position, n.time, n.ok, &n.kind);
-            if h == self.ideal_hand(n.position) {
-                self.ncorrect += 1;
-            }
-            self.recent.push_back((h, n.position.x, n.time));
-            if self.recent.len() > 100 {
-                self.recent.pop_front();
-            }
-        }
-        let _ = (line_id, time);
-    }
-
-    fn ideal_hand(&self, pos: Vector2) -> Hand {
-        if pos.x < 0.0 {
-            Hand::Left
-        } else {
-            Hand::Right
+    fn apply_hands(&mut self, notes: &mut [PNote], hands: &[Hand]) {
+        for (note, &hand) in notes.iter_mut().zip(hands.iter()) {
+            note.hand = Some(hand);
+            let matches_spatial_prior = hand == spatial_prior(note.position);
+            self.hs.update_finger_state(
+                hand,
+                FingerType::Index,
+                note.position,
+                note.time,
+                matches_spatial_prior,
+                &note.kind,
+            );
         }
     }
 
@@ -249,139 +201,170 @@ impl PhiTKAdvancedAI {
             return;
         }
         for i in 1..notes.len() - 1 {
-            if let (Some(p), Some(c), Some(n)) =
+            let (Some(previous), Some(current), Some(next)) =
                 (notes[i - 1].hand, notes[i].hand, notes[i + 1].hand)
-            {
-                if c != p && c != n && p == n {
-                    let gp = notes[i].time - notes[i - 1].time;
-                    let gn = notes[i + 1].time - notes[i].time;
-                    if gp > 0.15 && gn > 0.15 {
-                        let nx = notes[i].position.x;
-                        let pr = match p {
-                            Hand::Left => nx < 0.3,
-                            Hand::Right => nx > -0.3,
-                        };
-                        if pr {
-                            notes[i].hand = Some(p);
-                        }
-                    }
-                }
+            else {
+                continue;
+            };
+            if current == previous || current == next || previous != next {
+                continue;
+            }
+            let gap_previous = notes[i].time - notes[i - 1].time;
+            let gap_next = notes[i + 1].time - notes[i].time;
+            if gap_previous <= 0.15 || gap_next <= 0.15 {
+                continue;
+            }
+            let x = notes[i].position.x;
+            let close_to_previous = match previous {
+                Hand::Left => x < 0.3,
+                Hand::Right => x > -0.3,
+            };
+            if close_to_previous {
+                notes[i].hand = Some(previous);
             }
         }
     }
 
     fn limit_consecutive(&self, notes: &mut [PNote]) {
-        let mut cc = 0;
-        let mut lh = None;
-        for n in notes.iter_mut() {
-            if let Some(h) = n.hand {
-                if lh == Some(h) {
-                    cc += 1;
-                } else {
-                    cc = 1;
-                    lh = Some(h);
-                }
-                if cc > CONSECUTIVE_LIMIT {
-                    n.hand = Some(match h {
-                        Hand::Left => Hand::Right,
-                        Hand::Right => Hand::Left,
-                    });
-                    cc = 1;
-                    lh = n.hand;
-                }
+        let mut run = 0;
+        let mut last: Option<Hand> = None;
+        for note in notes.iter_mut() {
+            let Some(hand) = note.hand else { continue };
+            if last == Some(hand) {
+                run += 1;
+            } else {
+                run = 1;
+                last = Some(hand);
+            }
+            if run > CONSECUTIVE_LIMIT {
+                note.hand = Some(match hand {
+                    Hand::Left => Hand::Right,
+                    Hand::Right => Hand::Left,
+                });
+                run = 1;
+                last = note.hand;
             }
         }
     }
 
-    fn update_physical(&mut self, notes: &mut [PNote], t: f32) {
-        for n in notes.iter_mut() {
-            if let Some(h) = n.hand {
-                let (ok, _, _, _) =
-                    self.hs
-                        .evaluate_note_success(h, &n.position, n.time, t, &n.kind);
-                n.ok = ok;
+    fn update_physical(&mut self, notes: &mut [PNote], current_time: f32) {
+        for note in notes.iter_mut() {
+            let Some(hand) = note.hand else { continue };
+            let (feasible, position_error, time_error, _) =
+                self.hs
+                    .evaluate_note_success(hand, &note.position, note.time, current_time, &note.kind);
+            note.feasible = feasible;
+            note.time_error = time_error;
+            note.judgement = loss::judgement_from_errors(feasible, position_error, time_error, &note.kind);
+        }
+    }
+
+    fn apply(&self, notes: &mut [Note], processed: &[PNote]) {
+        for (note, processed) in notes.iter_mut().zip(processed.iter()) {
+            if let Some(hand) = processed.hand {
+                note.hand = hand;
             }
         }
     }
 
-    fn apply(&self, original: &mut [Note], processed: &[PNote]) {
-        for (i, p) in processed.iter().enumerate() {
-            if let Some(h) = p.hand {
-                original[i].hand = h;
+    /// The reward is the negative mean note loss of the physical model, so the
+    /// policy head and `loss.rs` score the same way.
+    fn store_experience(&mut self, notes: &[PNote]) {
+        let state = self.last_frame.clone();
+        let old_out = self.net.forward(&state);
+        let value = self.net.value_from(&old_out);
+        let actions = column_actions(notes);
+
+        let mut loss_sum = 0.0f32;
+        let mut counted = 0usize;
+        for note in notes {
+            if note.hand.is_none() {
+                continue;
             }
+            loss_sum += loss::note_loss(note.judgement, note.time_error, note.feasible);
+            counted += 1;
         }
-    }
+        let reward = if counted == 0 { 0.0 } else { -loss_sum / counted as f32 };
 
-    fn store_exp(&mut self, input: &[f32], hands: &[Hand], notes: &[Note]) {
-        let mut column_rewards = vec![0.0f32; super::AI_IMAGE_W];
-        for (n, &h) in notes.iter().zip(hands.iter()) {
-            let col = x_to_col(n.object.translation.0.now(), super::AI_IMAGE_W);
-            let correct = (h == Hand::Left) == (n.object.translation.0.now() < 0.0);
-            column_rewards[col] += if correct { 1.0 } else { -0.5 };
-        }
-        for v in column_rewards.iter_mut() {
-            *v = v.clamp(-1.0, 1.0);
-        }
-
-        let value = self.net.value_head(input);
-        let action = hands
-            .iter()
-            .fold(0usize, |a, &h| (a << 1) | (h == Hand::Right) as usize);
-        let log_prob = 0.0;
-
-        self.buf.push_back(Experience {
-            state: input.to_vec(),
-            action,
-            log_prob,
-            reward: column_rewards.iter().sum::<f32>() / column_rewards.len() as f32,
+        self.buffer.push_back(Experience {
+            state,
+            actions,
+            old_out,
+            reward,
             value,
-            next_value: 0.0,
-            done: false,
             advantage: 0.0,
             return_: 0.0,
-            old_out: column_rewards.clone(),
         });
-        if self.buf.len() > BUFFER_SIZE {
-            self.buf.pop_front();
+        if self.buffer.len() > BUFFER_SIZE {
+            self.buffer.pop_front();
         }
     }
 
     fn train(&mut self, epochs: usize, budget_ms: u64) {
-        if self.buf.len() < 64 {
+        if self.buffer.len() < MIN_SAMPLES {
             return;
         }
-        let n = 128.min(self.buf.len());
-        let mut exps: Vec<Experience> = self.buf.range(self.buf.len() - n..).cloned().collect();
+        let count = SAMPLE_LIMIT.min(self.buffer.len());
+        let mut samples: Vec<Experience> = self.buffer.range(self.buffer.len() - count..).cloned().collect();
 
-        let mut last_val = 0.0f32;
-        let mut last_adv = 0.0f32;
-        for i in (0..exps.len()).rev() {
-            let next_val = if exps[i].done { 0.0 } else { last_val };
-            let delta = exps[i].reward + GAE_GAMMA * next_val - exps[i].value;
-            let adv = if exps[i].done {
-                delta
-            } else {
-                delta + GAE_GAMMA * GAE_LAMBDA * last_adv
-            };
-            exps[i].advantage = adv;
-            exps[i].return_ = adv + exps[i].value;
-            last_val = exps[i].value;
-            last_adv = adv;
+        let mut next_value = 0.0f32;
+        let mut next_advantage = 0.0f32;
+        for sample in samples.iter_mut().rev() {
+            let delta = sample.reward + GAE_GAMMA * next_value - sample.value;
+            sample.advantage = delta + GAE_GAMMA * GAE_LAMBDA * next_advantage;
+            sample.return_ = sample.advantage + sample.value;
+            next_value = sample.value;
+            next_advantage = sample.advantage;
         }
 
-        let mean_adv = exps.iter().map(|e| e.advantage).sum::<f32>() / exps.len() as f32;
-        let std_adv = (exps.iter().map(|e| (e.advantage - mean_adv).powi(2)).sum::<f32>()
-            / exps.len() as f32)
+        let mean = samples.iter().map(|s| s.advantage).sum::<f32>() / samples.len() as f32;
+        let deviation = (samples
+            .iter()
+            .map(|s| (s.advantage - mean) * (s.advantage - mean))
+            .sum::<f32>()
+            / samples.len() as f32)
             .sqrt()
             .max(1e-8);
-        for e in exps.iter_mut() {
-            e.advantage = (e.advantage - mean_adv) / std_adv;
+        for sample in samples.iter_mut() {
+            sample.advantage = (sample.advantage - mean) / deviation;
         }
 
-        // hand the update to the background trainer instead of blocking here
-        if super::trainer::submit(&self.net, exps, epochs, budget_ms) {
-            self.eps = (self.eps * 0.999).max(0.05);
-            self.v.eps = self.eps;
+        let _ = super::trainer::submit(&self.net, samples, epochs, budget_ms);
+    }
+}
+
+fn read_model(filepath: &str) -> Option<PhiTKAdvancedAI> {
+    let bytes = fs::read(Path::new(filepath)).ok()?;
+    if bytes.len() <= MODEL_HEADER || bytes[..8] != MODEL_MAGIC {
+        return None;
+    }
+    if u32::from_le_bytes(bytes[8..12].try_into().ok()?) != MODEL_VERSION {
+        return None;
+    }
+    bincode::deserialize(&bytes[MODEL_HEADER..]).ok()
+}
+
+fn spatial_prior(position: Vector2) -> Hand {
+    if position.x < 0.0 {
+        Hand::Left
+    } else {
+        Hand::Right
+    }
+}
+
+/// The policy head is one Bernoulli bit per image column: right hand or not.
+fn column_actions(notes: &[PNote]) -> Vec<u8> {
+    let mut right = [0u16; AI_IMAGE_W];
+    let mut left = [0u16; AI_IMAGE_W];
+    for note in notes {
+        let Some(hand) = note.hand else { continue };
+        let column = column_of(note.position.x, AI_IMAGE_W);
+        match hand {
+            Hand::Left => left[column] += 1,
+            Hand::Right => right[column] += 1,
         }
     }
+    (0..AI_IMAGE_W)
+        .map(|column| (right[column] > left[column]) as u8)
+        .collect()
 }

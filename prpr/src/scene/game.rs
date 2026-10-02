@@ -1727,7 +1727,7 @@ impl Scene for GameScene {
         if self.display_score != self.actual_score {
             let diff = (self.actual_score as i32 - self.display_score as i32) as f32;
             let diff_magnitude = diff.abs();
-            const SPEED_FACTOR: f32 = 1.004;
+            const SPEED_FACTOR: f32 = 1.0008;
             let target_speed = diff_magnitude * SPEED_FACTOR;
             let speed_diff = target_speed - self.current_speed.abs();
             self.current_speed += speed_diff.signum() * speed_diff.abs() * dt * 5.0;

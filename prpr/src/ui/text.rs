@@ -93,7 +93,7 @@ impl<'a, 's, 'ui> DrawText<'a, 's, 'ui> {
         0.04 * self.size * w as f32
     }
 
-    fn measure_inner<'c>(&mut self, text: &'c str, painter: &mut Option<&mut TextPainter>) -> (Section<'c>, Rect) {
+    fn measure_inner<'c>(&mut self, text: &'c str, painter: &mut Option<&mut TextPainter>) -> (Section<'c>, Rect, (i32, i32, i32, i32)) {
         let vp = get_viewport();
         let scale = self.get_scale(vp.2);
         let mut section = Section::new().add_text(Text::new(text).with_scale(scale).with_color(self.color));
@@ -123,12 +123,12 @@ impl<'a, 's, 'ui> DrawText<'a, 's, 'ui> {
         let mut rect = Rect::new(self.pos.0, self.pos.1, bound.width() * s, height * s);
         rect.x -= rect.w * self.anchor.0;
         rect.y -= rect.h * self.anchor.1;
-        (section, rect)
+        (section, rect, vp)
     }
 
     pub fn measure_with_font(&mut self, mut painter: Option<&mut TextPainter>) -> Rect {
         let text = self.text.take().unwrap();
-        let (_, rect) = self.measure_inner(&text, &mut painter);
+        let (_, rect, _) = self.measure_inner(&text, &mut painter);
         self.text = Some(text);
         rect
     }
@@ -140,7 +140,14 @@ impl<'a, 's, 'ui> DrawText<'a, 's, 'ui> {
 
     fn paint_on(painter: &mut TextPainter, mut section: Section, scale: f32, ml: bool) {
         use glyph_brush::ab_glyph::{Point, Rect};
-        if ml {
+        // Without a width bound there is nothing to truncate, so hand the section to
+        // `queue` instead of pre-positioning it. That keeps the section hash in
+        // `section_buffer` (identical text yields `BrushAction::ReDraw` instead of
+        // rebuilding every glyph's vertices) and drops the two per-draw `Vec`
+        // allocations the pre-positioned path needs. Layout and bounds are the same:
+        // `Layout::bounds_rect` for `Left`/`Top` over infinite bounds is exactly
+        // `(0, 0)..(INF, INF)`, which is what the pre-positioned path passed.
+        if ml || section.bounds.0.is_infinite() {
             painter.brush.queue(section);
             return;
         }
@@ -184,8 +191,7 @@ impl<'a, 's, 'ui> DrawText<'a, 's, 'ui> {
 
     pub fn draw_with_font(mut self, mut painter: Option<&mut TextPainter>) -> Rect {
         let text = std::mem::take(&mut self.text).unwrap();
-        let (section, rect) = self.measure_inner(&text, &mut painter);
-        let vp = get_viewport();
+        let (section, rect, vp) = self.measure_inner(&text, &mut painter);
         let s = vp.2 as f32 / 2.;
         let scale = self.get_scale(vp.2);
         if let Some(painter) = &mut painter {
@@ -219,6 +225,11 @@ static TEXTURE_DIM: Lazy<u32> = Lazy::new(|| unsafe {
     (size as u32).min(2048)
 });
 
+/// Glyph cache size we start with. Growing through the `TextureTooSmall` path
+/// in `submit` is much cheaper than allocating the largest texture the GPU can
+/// provide (up to 2048x2048 = 16 MB) before a single glyph has been drawn.
+const INITIAL_CACHE_DIM: u32 = 512;
+
 pub struct TextPainter {
     brush: GlyphBrush<[Vertex; 4]>,
     cache_texture: Texture2D,
@@ -229,9 +240,8 @@ pub struct TextPainter {
 impl TextPainter {
     pub fn new(font: FontArc) -> Self {
         let mut brush = GlyphBrushBuilder::using_font(font).build();
-        let dim = *TEXTURE_DIM;
+        let dim = INITIAL_CACHE_DIM.min(*TEXTURE_DIM);
         brush.resize_texture(dim, dim);
-        // TODO optimize
         let cache_texture = Self::new_cache_texture(brush.texture_dimensions());
         Self {
             brush,
@@ -303,6 +313,13 @@ impl TextPainter {
                     if !flushed {
                         unsafe { get_internal_gl() }.flush();
                         flushed = true;
+                    }
+                    // Grow, but never past what the GPU can hold. When we are
+                    // already at that limit there is nothing left to do, so drop
+                    // this batch instead of spinning in the loop forever.
+                    let suggested = (suggested.0.min(*TEXTURE_DIM), suggested.1.min(*TEXTURE_DIM));
+                    if suggested == self.brush.texture_dimensions() {
+                        break;
                     }
                     self.cache_texture.delete();
                     self.cache_texture = Self::new_cache_texture(suggested);

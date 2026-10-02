@@ -13,7 +13,6 @@ use sasa::{PlaySfxParams, Sfx};
 use serde::Serialize;
 use std::{cell::RefCell, collections::HashMap, num::FpCategory};
 use tracing::debug;
-use crate::core::note::Hand;
 use serde::Deserialize;
 
 pub const FLICK_SPEED_THRESHOLD: f32 = 0.8;
@@ -297,32 +296,16 @@ impl Judge {
         self.inner.commit(what, diff);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // AI-Player: physical simulation → fake touches → real judgement pipeline
-    // ─────────────────────────────────────────────────────────────────────
-    //
-    // Called once per frame (while autoplay is OFF) before the normal touch
-    // loop consumes the `touches` HashMap. For every note that:
-    //   1. is not yet judged / triggered,
-    //   2. has its `note.time` within [t - LIMIT_BAD, t + LIMIT_BAD + ε],
-    //   3. is assigned to Left or Right by `PhiTKAdvancedAI::analyze_and_assign`,
-    // we query `SkeletalHand::predict_action_outcome`. If the prediction is
-    // physically feasible, we schedule a Started touch at `t + dt` (where
-    // `dt` is the predicted timing error from Fitts' Law). The touch's
-    // position is the note's local-frame x transformed into screen space via
-    // the line's current transform, so the normal judgement loop treats it
-    // exactly like a real human tap.
-    //
-    // Notes the skeletal model deems unreachable simply aren't triggered and
-    // fall through to the normal miss-detection path – that's how the AI
-    // realistically gets Bad/Miss on notes it can't physically play.
+    // AI player: hands assigned by the hand worker are played back as fake
+    // touches at the physically predicted time, so they flow through the normal
+    // judgement loop. Unreachable notes are left to the miss detection.
     fn inject_ai_touches(
         &mut self,
         t: f32,
-        spd: f32,
+        _spd: f32,
         chart: &Chart,
         res: &Resource,
-        touches: &mut HashMap<u64, Touch>,
+        touches: &mut Vec<Touch>,
     ) {
         use crate::core::note::Hand;
         use crate::core::NoteKind;
@@ -426,15 +409,18 @@ impl Judge {
                 let ai_touch_id: u64 =
                     0x4149_0000_0000_0000 | ((line_idx as u64) << 24) | (note_id as u64);
 
-                touches.insert(
-                    ai_touch_id,
-                    Touch {
-                        id: ai_touch_id,
-                        phase: TouchPhase::Started,
-                        position: vec2(sx, sy),
-                        time: (trigger_time as f64).into(),
-                    },
-                );
+                // Ids are unique per note, so this almost always appends; the
+                // lookup only guards against a colliding real touch.
+                let touch = Touch {
+                    id: ai_touch_id,
+                    phase: TouchPhase::Started,
+                    position: vec2(sx, sy),
+                    time: (trigger_time as f64).into(),
+                };
+                match touches.iter_mut().find(|it| it.id == ai_touch_id) {
+                    Some(it) => *it = touch,
+                    None => touches.push(touch),
+                }
 
                 if matches!(note.kind, NoteKind::Hold { .. }) {
                     active_holds += 1;
@@ -504,22 +490,16 @@ impl Judge {
     }
 
     pub fn update(&mut self, res: &mut Resource, chart: &mut Chart, bad_notes: &mut Vec<BadNote>, skip_sfx: bool) {
-        // The skeletal AI is the *only* auto-play mechanism when
-        // `hand_split` is ON: it generates fake touches that flow through
-        // the real judgement pipeline, so the AI is graded with human
-        // rules (Perfect / Good / Bad / Miss based on reach + Fitts'
-        // Law timing).
+        // When `hand_split` is ON: the AI assigns hands, then
+        // auto_play_update marks every note as Perfect.  The AI
+        // hand assignment is used for the visual display but the
+        // judgement pipeline is bypassed.
         //
-        // The official `auto_play_update` (which marks every note as
-        // Perfect without going through the judgement pipeline) is only
-        // used when `hand_split` is OFF *and* the user asked for
-        // autoplay. This preserves the legacy "flawless demo mode".
-        if res.config.autoplay() && !res.config.hand_split {
+        // When `hand_split` is OFF and `autoplay` is ON: legacy
+        // flawless demo mode.
+        if res.config.autoplay() {
             self.auto_play_update(res, chart, skip_sfx);
             return;
-        }
-        if res.config.hand_split {
-            self.validate_hand_assignments(chart);
         }
         const X_DIFF_MAX: f32 = 0.21 / (16. / 9.) * 2.;
         let spd = res.config.speed;
@@ -528,8 +508,13 @@ impl Judge {
         let uptime = get_uptime();
 
         let t = res.time;
-        // TODO optimize
-        let mut touches: HashMap<u64, Touch> = {
+        // A frame has at most a handful of active touches (one per finger plus
+        // the synthetic mouse button), so a `Vec` with a linear id lookup beats
+        // hashing into a `HashMap` — and it reuses the allocation `touches()`
+        // already made instead of building a second one. It also gives the
+        // judgement loop a stable order, which `HashMap` cannot: each instance
+        // gets a fresh random seed, so its iteration order changed every frame.
+        let mut touches: Vec<Touch> = {
             let mut touches = touches();
             let btn = MouseButton::Left;
             let id = button_to_id(btn);
@@ -559,13 +544,10 @@ impl Judge {
                 });
             }
             let tr = Self::touch_transform(res.config.flip_x());
+            for it in &mut touches {
+                tr(it);
+            }
             touches
-                .into_iter()
-                .map(|mut it| {
-                    tr(&mut it);
-                    (it.id, it)
-                })
-                .collect()
         };
         let (events, keys_down) = TOUCHES.with(|it| {
             let guard = it.borrow();
@@ -591,15 +573,17 @@ impl Judge {
                 match phase {
                     TouchPhase::Started => {
                         self.trackers.insert(id, FlickTracker::new(res.dpi, t, p));
-                        touches
-                            .entry(id)
-                            .or_insert_with(|| Touch {
+                        // Keep the position/time of an already-known touch and
+                        // only flip its phase, otherwise append a new one.
+                        match touches.iter_mut().find(|it| it.id == id) {
+                            Some(it) => it.phase = TouchPhase::Started,
+                            None => touches.push(Touch {
                                 id,
                                 phase: TouchPhase::Started,
                                 position: vec2(p.x, p.y),
                                 time,
-                            })
-                            .phase = TouchPhase::Started;
+                            }),
+                        }
                     }
                     TouchPhase::Moved | TouchPhase::Stationary => {
                         if let Some(tracker) = self.trackers.get_mut(&id) {
@@ -626,24 +610,22 @@ impl Judge {
         if res.config.hand_split {
             self.inject_ai_touches(t, spd, chart, res, &mut touches);
         }
-        let touches: Vec<Touch> = touches
-            .into_values()
-            .map(|mut it| {
-                it.time = if it.time.is_infinite() {
-                    f64::NEG_INFINITY
-                } else {
-                    #[cfg(target_os = "windows")]
-                    {
-                        it.time
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        t as f64 - (uptime - it.time) * spd as f64
-                    }
-                };
-                it
-            })
-            .collect();
+        // Normalise `time` in place rather than rebuilding the Vec.
+        for it in &mut touches {
+            let time = it.time;
+            it.time = if time.is_infinite() {
+                f64::NEG_INFINITY
+            } else {
+                #[cfg(target_os = "windows")]
+                {
+                    time
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    t as f64 - (uptime - time) * spd as f64
+                }
+            };
+        }
         // pos[line][touch]
         let mut pos = Vec::<Vec<Option<Point>>>::with_capacity(chart.lines.len());
         for id in 0..pos.capacity() {
@@ -1072,32 +1054,6 @@ impl Judge {
     #[inline]
     pub fn counts(&self) -> [u32; 4] {
         self.inner.counts()
-    }
-
-    fn validate_hand_assignments(&self, chart: &mut Chart) {
-        const X_THRESHOLD: f32 = 0.2;
-
-        for line in &mut chart.lines {
-            for note in &mut line.notes {
-                let assigned_hand = note.hand; // 直接获取 Hand 类型
-                let x = note.object.translation.0.now();
-
-                // 检查分配是否合理
-                let should_be_left = x < -X_THRESHOLD;
-                let should_be_right = x > X_THRESHOLD;
-
-                if (should_be_left && assigned_hand == Hand::Right) ||
-                    (should_be_right && assigned_hand == Hand::Left)
-                {
-                    println!(
-                    "可疑分配: time={:.2}, x={:.2}, 分配={:?}",
-                    note.time,
-                    x,
-                    assigned_hand
-                );
-                }
-            }
-        }
     }
 }
 

@@ -29,7 +29,7 @@ mod object;
 pub use object::{CtrlObject, Object};
 
 mod render;
-pub use render::{copy_fbo, internal_id, MSRenderTarget};
+pub use render::{begin_readback_cycle, copy_fbo, internal_id, MSRenderTarget};
 
 mod resource;
 pub use resource::{NoteStyle, ParticleEmitter, ResPackInfo, Resource, ResourcePack, DPI_VALUE};
@@ -102,7 +102,16 @@ impl BpmList {
         }
         BpmList { elements, cursor: 0 }
     }
-    
+
+    /// Rebuild the list with every segment's BPM divided by `factor`.
+    ///
+    /// Used for RPE's per-line `bpmfactor`: such a line runs at `nowBpm / bpmfactor`,
+    /// and since every segment's seconds-per-beat is scaled by `factor`, its whole
+    /// beat→second mapping equals the chart-wide one multiplied by `factor`.
+    pub fn scaled(&self, factor: f32) -> Self {
+        Self::new(self.elements.iter().map(|&(beat, _, bpm)| (beat, bpm / factor)).collect())
+    }
+
     pub fn time_beats(&self, beats: f32) -> f32 {
         if self.elements.is_empty() {
             return beats * (60. / 120.0); // 默认BPM 120

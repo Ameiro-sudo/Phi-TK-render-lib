@@ -357,10 +357,17 @@ impl Tweenable for String {
             } else if x.is_empty() {
                 let chars = y.chars().collect::<Vec<_>>();
                 chars[..(t * chars.len() as f32).round() as usize].iter().collect()
+            } else if x == y {
+                // Identical keys: the branch below would walk both strings, count their
+                // chars and rebuild an equal String. Reaching here implies neither
+                // contains "%P%" (that case is handled above), so the result is just x.
+                x.clone()
             } else {
                 let x_len = x.chars().count();
                 let y_len = y.chars().count();
-                if x.chars().zip(y.chars()).take(x_len).all(|(xc, yc)| xc == yc) {
+                // `zip` already stops at the shorter side, so the extra `take(x_len)`
+                // was a no-op.
+                if x.chars().zip(y.chars()).all(|(xc, yc)| xc == yc) {
                     let take_num = ((y_len - x_len) as f32 * t).round() as usize + x_len;
                     let mut text = x.clone();
                     text.push_str(&y.chars().skip(x_len).take(take_num - x_len).collect::<String>());

@@ -667,7 +667,11 @@ impl<'a> Ui<'a> {
         let gl = unsafe { get_internal_gl() }.quad_gl;
         gl.texture(texture);
         gl.draw_mode(DrawMode::Triangles);
-        gl.geometry(&std::mem::take(&mut self.vertex_buffers.vertices), &std::mem::take(&mut self.vertex_buffers.indices));
+        gl.geometry(&self.vertex_buffers.vertices, &self.vertex_buffers.indices);
+        // Keep the allocation: `std::mem::take` here made every circle/path pay
+        // two deallocations plus two reallocations on the next draw.
+        self.vertex_buffers.vertices.clear();
+        self.vertex_buffers.indices.clear();
     }
 
     pub fn get_matrix(&self) -> Matrix {

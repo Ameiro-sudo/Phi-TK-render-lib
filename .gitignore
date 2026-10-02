@@ -1,5 +1,7 @@
 inner.rs
 
+/.vs
+/.idea
 /.env
 /http-cacache
 /prpr/build.rs

@@ -1,9 +1,6 @@
-//! Background PPO trainer.
-//!
-//! Keeps heavy weight updates off the AI worker thread (and therefore off the
-//! frame budget): `submit` hands a cloned network plus a batch of experiences
-//! to a dedicated thread, `poll` picks the trained network back up. Only one
-//! job is ever in flight, so results can never be mismatched with their owner.
+//! Background PPO trainer. One job is in flight at a time, so a trained network
+//! can never be mismatched with its owner: `submit` hands a cloned network plus
+//! a batch of experiences to the worker thread, `poll` picks the result up.
 
 use super::network::DeepNeuralNetwork;
 use super::Experience;
@@ -16,8 +13,8 @@ use std::thread;
 use std::time::Duration;
 
 struct Job {
-    net: DeepNeuralNetwork,
-    exps: Vec<Experience>,
+    network: DeepNeuralNetwork,
+    experiences: Vec<Experience>,
     epochs: usize,
     budget: Duration,
 }
@@ -40,12 +37,12 @@ fn init() {
             let _ = DONE_RX.set(done_rx);
             let _ = JOB_TX.set(job_tx);
         }
-        // on failure the cells stay unset, so submit() fails cleanly
+        // On failure the cells stay unset, so `submit` just reports "not queued".
     });
 }
 
 fn run(job_rx: Receiver<Job>) {
-    // half of the cores, at most 4, so the render/game threads keep headroom
+    // Half of the cores, at most four, so render and game threads keep headroom.
     let threads = thread::available_parallelism()
         .map(|n| n.get() / 2)
         .unwrap_or(2)
@@ -56,50 +53,40 @@ fn run(job_rx: Receiver<Job>) {
         .build();
 
     while let Ok(job) = job_rx.recv() {
-        let Job { mut net, exps, epochs, budget } = job;
-        let trained = catch_unwind(AssertUnwindSafe(|| {
-            match &pool {
-                Ok(p) => p.install(|| net.train_with_ppo(&exps, epochs, budget)),
-                Err(_) => net.train_with_ppo(&exps, epochs, budget),
-            }
+        let Job { mut network, experiences, epochs, budget } = job;
+        let trained = catch_unwind(AssertUnwindSafe(|| match &pool {
+            Ok(pool) => pool.install(|| network.train_with_ppo(&experiences, epochs, budget)),
+            Err(_) => network.train_with_ppo(&experiences, epochs, budget),
         }));
         match trained {
             Ok(()) => {
-                // drop any stale result, keep the channel at most one deep
+                // Keep the channel one deep and drop a stale result instead of blocking.
                 if let Some(tx) = DONE_TX.get() {
-                    let _ = tx.try_send(net);
+                    let _ = tx.try_send(network);
                 }
             }
-            Err(_) => {
-                // training panicked: release the slot instead of wedging forever
-                PENDING.store(false, Ordering::SeqCst);
-            }
+            Err(_) => PENDING.store(false, Ordering::SeqCst),
         }
     }
 }
 
-/// Queue a PPO update on the trainer thread.
-///
-/// Returns `false` when nothing was queued (no work, or a job is already in
-/// flight) — the caller should then keep its current network untouched.
-pub fn submit(net: &DeepNeuralNetwork, exps: Vec<Experience>, epochs: usize, budget_ms: u64) -> bool {
-    if epochs == 0 || exps.is_empty() {
+/// Queues a PPO update. Returns `false` when nothing was queued (no work, or a
+/// job is already in flight), in which case the caller keeps its network.
+pub fn submit(network: &DeepNeuralNetwork, experiences: Vec<Experience>, epochs: usize, budget_ms: u64) -> bool {
+    if epochs == 0 || experiences.is_empty() {
         return false;
     }
     if PENDING.swap(true, Ordering::SeqCst) {
         return false;
     }
     init();
-    let tx = match JOB_TX.get() {
-        Some(tx) => tx,
-        None => {
-            PENDING.store(false, Ordering::SeqCst);
-            return false;
-        }
+    let Some(tx) = JOB_TX.get() else {
+        PENDING.store(false, Ordering::SeqCst);
+        return false;
     };
     match tx.try_send(Job {
-        net: net.clone(),
-        exps,
+        network: network.clone(),
+        experiences,
         epochs,
         budget: Duration::from_millis(budget_ms),
     }) {
@@ -111,13 +98,13 @@ pub fn submit(net: &DeepNeuralNetwork, exps: Vec<Experience>, epochs: usize, bud
     }
 }
 
-/// Take a freshly trained network, if the trainer finished one.
+/// Takes a freshly trained network, if the trainer finished one.
 pub fn poll() -> Option<DeepNeuralNetwork> {
-    let rx = DONE_RX.get()?;
-    match rx.try_recv() {
-        Ok(net) => {
+    let receiver = DONE_RX.get()?;
+    match receiver.try_recv() {
+        Ok(network) => {
             PENDING.store(false, Ordering::SeqCst);
-            Some(net)
+            Some(network)
         }
         Err(_) => None,
     }
@@ -134,43 +121,37 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-
-    fn exps(n: usize) -> Vec<Experience> {
-        (0..n)
+    fn experiences(count: usize) -> Vec<Experience> {
+        (0..count)
             .map(|i| Experience {
                 state: vec![0.05 * (i as f32 + 1.0); crate::hand::AI_IMAGE_SIZE],
-                action: i,
-                log_prob: 0.0,
+                actions: vec![(i % 2) as u8; crate::hand::AI_IMAGE_W],
+                old_out: vec![0.2; crate::hand::AI_IMAGE_W],
                 reward: 0.5,
                 value: 0.1,
-                next_value: 0.0,
-                done: false,
                 advantage: 0.3,
                 return_: 0.4,
-                old_out: vec![0.2; crate::hand::AI_IMAGE_W],
             })
             .collect()
     }
 
     #[test]
     fn submit_rejects_empty_job() {
-        let net = DeepNeuralNetwork::new();
-        assert!(!submit(&net, vec![], 4, 50));
-        assert!(!submit(&net, exps(8), 0, 50));
+        let network = DeepNeuralNetwork::new();
+        assert!(!submit(&network, Vec::new(), 4, 50));
+        assert!(!submit(&network, experiences(8), 0, 50));
     }
 
-    /// Round trip through the background thread: submit never blocks the
-    /// caller, and the trained network comes back through `poll`.
     #[test]
     fn trainer_roundtrip() {
-        let net = DeepNeuralNetwork::new();
-        assert!(submit(&net, exps(8), 1, 30_000), "job should be queued");
+        let network = DeepNeuralNetwork::new();
+        assert!(submit(&network, experiences(8), 1, 30_000), "job should be queued");
         assert!(is_pending());
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let trained = loop {
-            if let Some(n) = poll() {
-                break Some(n);
+            if let Some(network) = poll() {
+                break Some(network);
             }
             if Instant::now() >= deadline {
                 break None;
@@ -182,4 +163,3 @@ mod tests {
         assert!(!is_pending(), "slot must be released after poll");
     }
 }
-

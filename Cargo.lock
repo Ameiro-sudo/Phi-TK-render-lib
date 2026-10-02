@@ -5427,6 +5427,7 @@ dependencies = [
  "memmap2",
  "miniquad",
  "miniz_oxide 0.7.4",
+ "naga",
  "nalgebra",
  "ndk-context",
  "num_cpus",

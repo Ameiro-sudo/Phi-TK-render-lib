@@ -12,8 +12,6 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use tracing::warn;
 use crate::core::note::Hand;
-use crate::hand::assign_hands;
-use crate::config::Config;
 use std::rc::Rc;
 use std::cell::RefCell;
 use crate::core::CtrlObject;
@@ -187,7 +185,7 @@ fn parse_speed_events(mut pec: Vec<(f32, f32)>, max_time: f32) -> AnimFloat {
     AnimFloat::new(kfs)
 }
 
-fn parse_judge_line(mut pec: PECJudgeLine, id: usize, max_time: f32, r: &mut BpmList) -> Result<JudgeLine> {
+fn parse_judge_line(mut pec: PECJudgeLine, id: usize, max_time: f32) -> Result<JudgeLine> {
     let mut height = parse_speed_events(pec.speed_events, max_time);
     let mut process_notes = |notes: &mut Vec<Note>| {
         for note in notes {
@@ -207,12 +205,9 @@ fn parse_judge_line(mut pec: PECJudgeLine, id: usize, max_time: f32, r: &mut Bpm
         }
     });
     process_notes(&mut pec.notes);
-    let config = Config::default();
     let mut rotation_anim = parse_events(pec.rotate_events, id, "rotate")?;
     rotation_anim.set_time(0.0);
-    let initial_rotation_rad = rotation_anim.now().to_radians();
     process_notes(&mut pec.notes);
-    assign_hands(&mut pec.notes, &config, id, initial_rotation_rad, r);
     let cache = JudgeLineCache::new(&mut pec.notes);
     Ok(JudgeLine {
         object: Object {
@@ -455,7 +450,7 @@ pub fn parse_pec_with_list(source: &str, extra: ChartExtra, _r: &mut BpmList) ->
     let mut lines = lines
         .into_iter()
         .enumerate()
-        .map(|(id, line)| parse_judge_line(line, id, max_time, bpm!()).with_context(|| ptl!("judge-line-location", "jlid" => id)))
+        .map(|(id, line)| parse_judge_line(line, id, max_time).with_context(|| ptl!("judge-line-location", "jlid" => id)))
         .collect::<Result<Vec<_>>>()?;
     process_lines(&mut lines);
     ensure_bpm(&mut r, &mut bpm_list);

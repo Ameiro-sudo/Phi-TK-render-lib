@@ -1,86 +1,80 @@
-// ViT forward: patch embed -> encoder blocks (self-attn + FFN) -> query cross-attn + classify
-// Geometry must match hand/vit.rs (PS/PG/PH/NP/PD/D/NH/HD/NL/NF).
+// ViT forward for hand assignment: patch embed -> encoder blocks
+// (self-attention + FFN) -> per-note cross-attention + classifier.
+// Geometry and packed offsets mirror hand/vit.rs and gpu_vit.rs::offs.
 
-const PS: u32 = 5u;
-const PG: u32 = 16u;
-const PH: u32 = 9u;
-const NP: u32 = 144u;
-const PD: u32 = 75u;
-const D: u32 = 64u;
-const NH: u32 = 4u;
-const HD: u32 = 16u;
-const NL: u32 = 2u;
-const NF: u32 = 16u;
-const IW: u32 = 80u;
-const IH: u32 = 45u;
-const IC: u32 = 3u;
-const FF: u32 = 256u; // 4 * D
-const QD: u32 = 128u; // 2 * D fused
+const PATCH_SIZE: u32 = 5u;
+const PATCH_COLS: u32 = 16u;
+const PATCH_ROWS: u32 = 9u;
+const PATCH_COUNT: u32 = 144u;
+const PATCH_DIM: u32 = 75u;
+const MODEL_DIM: u32 = 64u;
+const HEAD_COUNT: u32 = 4u;
+const HEAD_DIM: u32 = 16u;
+const BLOCK_COUNT: u32 = 2u;
+const NOTE_FEATURE_DIM: u32 = 16u;
+const IMAGE_W: u32 = 80u;
+const IMAGE_H: u32 = 45u;
+const IMAGE_CHANNELS: u32 = 3u;
+const FFN_DIM: u32 = 256u;
+const FUSED_DIM: u32 = 128u;
 
-// packed weight offsets (f32 indices) — keep in sync with gpu_vit.rs::offs
-const OFF_PE: u32 = 0u;
-const OFF_PEB: u32 = OFF_PE + (D * PD);
-const OFF_POS: u32 = OFF_PEB + D;
-const OFF_NE: u32 = OFF_POS + (NP * D);
-const OFF_NEB: u32 = OFF_NE + (D * NF);
-const LAY0: u32 = OFF_NEB + D;
-// per layer: ln0g ln0b | q q | k k | v v | o o | ln1g ln1b | f0 f0 | f1 f1
-const L0_LN0G: u32 = 0u;
-const L0_LN0B: u32 = L0_LN0G + D;
-const L0_QW: u32 = L0_LN0B + D;
-const L0_QB: u32 = L0_QW + (D * D);
-const L0_KW: u32 = L0_QB + D;
-const L0_KB: u32 = L0_KW + (D * D);
-const L0_VW: u32 = L0_KB + D;
-const L0_VB: u32 = L0_VW + (D * D);
-const L0_OW: u32 = L0_VB + D;
-const L0_OB: u32 = L0_OW + (D * D);
-const L0_LN1G: u32 = L0_OB + D;
-const L0_LN1B: u32 = L0_LN1G + D;
-const L0_F0W: u32 = L0_LN1B + D;
-const L0_F0B: u32 = L0_F0W + (FF * D);
-const L0_F1W: u32 = L0_F0B + FF;
-const L0_F1B: u32 = L0_F1W + (D * FF);
-const LAY_SZ: u32 = L0_F1B + D;
-const OFF_FC: u32 = LAY0 + (NL * LAY_SZ);
-const W_LEN: u32 = OFF_FC + QD + 1u;
+const OFF_PATCH_WEIGHTS: u32 = 0u;
+const OFF_PATCH_BIAS: u32 = OFF_PATCH_WEIGHTS + (MODEL_DIM * PATCH_DIM);
+const OFF_POSITIONAL: u32 = OFF_PATCH_BIAS + MODEL_DIM;
+const OFF_NOTE_WEIGHTS: u32 = OFF_POSITIONAL + (PATCH_COUNT * MODEL_DIM);
+const OFF_NOTE_BIAS: u32 = OFF_NOTE_WEIGHTS + (MODEL_DIM * NOTE_FEATURE_DIM);
+const BLOCK_BASE: u32 = OFF_NOTE_BIAS + MODEL_DIM;
 
-struct VitP {
-    nq: u32,
+const B_ATTN_GAIN: u32 = 0u;
+const B_QUERY_WEIGHTS: u32 = B_ATTN_GAIN + MODEL_DIM;
+const B_QUERY_BIAS: u32 = B_QUERY_WEIGHTS + (MODEL_DIM * MODEL_DIM);
+const B_KEY_WEIGHTS: u32 = B_QUERY_BIAS + MODEL_DIM;
+const B_KEY_BIAS: u32 = B_KEY_WEIGHTS + (MODEL_DIM * MODEL_DIM);
+const B_VALUE_WEIGHTS: u32 = B_KEY_BIAS + MODEL_DIM;
+const B_VALUE_BIAS: u32 = B_VALUE_WEIGHTS + (MODEL_DIM * MODEL_DIM);
+const B_OUT_WEIGHTS: u32 = B_VALUE_BIAS + MODEL_DIM;
+const B_OUT_BIAS: u32 = B_OUT_WEIGHTS + (MODEL_DIM * MODEL_DIM);
+const B_FFN_GAIN: u32 = B_OUT_BIAS + MODEL_DIM;
+const B_FFN_IN_WEIGHTS: u32 = B_FFN_GAIN + MODEL_DIM;
+const B_FFN_IN_BIAS: u32 = B_FFN_IN_WEIGHTS + (FFN_DIM * MODEL_DIM);
+const B_FFN_OUT_WEIGHTS: u32 = B_FFN_IN_BIAS + FFN_DIM;
+const B_FFN_OUT_BIAS: u32 = B_FFN_OUT_WEIGHTS + (MODEL_DIM * FFN_DIM);
+const BLOCK_SIZE: u32 = B_FFN_OUT_BIAS + MODEL_DIM;
+
+const OFF_CLASSIFIER: u32 = BLOCK_BASE + (BLOCK_COUNT * BLOCK_SIZE);
+
+struct VitParams {
+    query_count: u32,
     layer: u32,
-    _p0: u32,
-    _p1: u32,
+    final_in_second: u32,
+    _pad: u32,
 };
 
-@group(0) @binding(0) var<uniform> p: VitP;
-@group(0) @binding(1) var<storage, read> img: array<f32>;
-@group(0) @binding(2) var<storage, read_write> tk: array<f32>;
-@group(0) @binding(3) var<storage, read> w: array<f32>;
-@group(0) @binding(4) var<storage, read> qin: array<f32>;
-@group(0) @binding(5) var<storage, read_write> out: array<f32>;
-@group(0) @binding(6) var<storage, read> qp: array<u32>;
-@group(0) @binding(7) var<storage, read_write> tkb: array<f32>;
+@group(0) @binding(0) var<uniform> layer_params: VitParams;
+@group(0) @binding(1) var<storage, read> frame: array<f32>;
+@group(0) @binding(2) var<storage, read_write> tokens_a: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<storage, read> query_features: array<f32>;
+@group(0) @binding(5) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(6) var<storage, read> query_patches: array<u32>;
+@group(0) @binding(7) var<storage, read_write> tokens_b: array<f32>;
 
-fn ok_f(s: f32) -> f32 {
-    if (s != s) {return 0.0;}
-    return clamp(s, -50.0, 50.0);
+fn sanitize(value: f32) -> f32 {
+    if (value != value) {
+        return 0.0;
+    }
+    return clamp(value, -50.0, 50.0);
 }
 
-fn layernorm(x: ptr<function, array<f32, 64>>, goff: u32, boff: u32) {
-    var m = 0.0;
-    for (var i = 0u; i < D; i++) {
-        m += (*x)[i];
+// Root-mean-square normalisation: x / sqrt(mean(x^2) + eps) * gain.
+fn rmsnorm(x: ptr<function, array<f32, MODEL_DIM>>, gain_offset: u32) {
+    var sum_squares = 0.0;
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        sum_squares += (*x)[i] * (*x)[i];
     }
-    m /= f32(D);
-    var v = 0.0;
-    for (var i = 0u; i < D; i++) {
-        let d = (*x)[i] - m;
-        v += d * d;
-    }
-    v /= f32(D);
-    let r = inverseSqrt(v + 1e-5);
-    for (var i = 0u; i < D; i++) {
-        (*x)[i] = ((*x)[i] - m) * r * w[goff + i] + w[boff + i];
+    let inv_rms = inverseSqrt(sum_squares / f32(MODEL_DIM) + 1e-5);
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        (*x)[i] = (*x)[i] * inv_rms * weights[gain_offset + i];
     }
 }
 
@@ -88,291 +82,305 @@ fn gelu(x: f32) -> f32 {
     return 0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
 }
 
-fn load_tok(j: u32, src_to_b: bool, dst: ptr<function, array<f32, D>>) {
-    for (var i = 0u; i < D; i++) {
-        (*dst)[i] = select(tkb[j * D + i], tk[j * D + i], src_to_b);
+fn load_token(index: u32, from_tokens_b: bool, out: ptr<function, array<f32, MODEL_DIM>>) {
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        (*out)[i] = select(tokens_a[index * MODEL_DIM + i], tokens_b[index * MODEL_DIM + i], from_tokens_b);
     }
 }
 
+// One patch -> one token: patch embed + learned positional table.
 @compute @workgroup_size(64)
 fn embed(@builtin(global_invocation_id) id: vec3<u32>) {
-    let pe_i = id.x;
-    if (pe_i >= NP) {
+    let patch_id = id.x;
+    if (patch_id >= PATCH_COUNT) {
         return;
     }
-    let px = pe_i % PG;
-    let py = pe_i / PG;
-    var raw: array<f32, PD>;
+    let col = patch_id % PATCH_COLS;
+    let row = patch_id / PATCH_COLS;
+    var raw: array<f32, PATCH_DIM>;
     var i = 0u;
-    for (var dy = 0u; dy < PS; dy++) {
-        for (var dx = 0u; dx < PS; dx++) {
-            let sx = px * PS + dx;
-            let sy = py * PS + dy;
-            let si = (sy * IW + sx) * IC;
-            for (var ch = 0u; ch < IC; ch++) {
-                let idx = si + ch;
-                if (idx < arrayLength(&img)) {
-                    raw[i] = img[idx];
+    for (var dy = 0u; dy < PATCH_SIZE; dy++) {
+        for (var dx = 0u; dx < PATCH_SIZE; dx++) {
+            let x = col * PATCH_SIZE + dx;
+            let y = row * PATCH_SIZE + dy;
+            let start = (y * IMAGE_W + x) * IMAGE_CHANNELS;
+            for (var channel = 0u; channel < IMAGE_CHANNELS; channel++) {
+                let index = start + channel;
+                if (index < arrayLength(&frame)) {
+                    raw[i] = frame[index];
                 }
                 i++;
             }
         }
     }
-    for (var r = 0u; r < D; r++) {
-        var s = w[OFF_PEB + r];
-        for (var c = 0u; c < PD; c++) {
-            s += w[OFF_PE + r * PD + c] * raw[c];
+    for (var r = 0u; r < MODEL_DIM; r++) {
+        var sum = weights[OFF_PATCH_BIAS + r];
+        for (var c = 0u; c < PATCH_DIM; c++) {
+            sum += weights[OFF_PATCH_WEIGHTS + r * PATCH_DIM + c] * raw[c];
         }
-        tk[pe_i * D + r] = ok_f(s) + w[OFF_POS + pe_i * D + r];
+        tokens_a[patch_id * MODEL_DIM + r] = sanitize(sum) + weights[OFF_POSITIONAL + patch_id * MODEL_DIM + r];
     }
 }
 
-// p.layer even: tk -> tkb; odd: tkb -> tk (ping-pong avoids cross-thread races)
+// Even layer reads tokens_a and writes tokens_b, odd layer the reverse; the
+// ping-pong keeps every thread reading its own source buffer.
 @compute @workgroup_size(64)
-fn enc(@builtin(global_invocation_id) id: vec3<u32>) {
-    let ti = id.x;
-    if (ti >= NP) {return;}
-    let lo = LAY0 + p.layer * LAY_SZ;
-    let src_to_b = (p.layer & 1u) == 0u;
-    var x: array<f32, D>;
-    for (var i = 0u; i < D; i++) {
-        x[i] = select(tkb[ti * D + i], tk[ti * D + i], src_to_b);
+fn encode(@builtin(global_invocation_id) id: vec3<u32>) {
+    let token_index = id.x;
+    if (token_index >= PATCH_COUNT) {
+        return;
     }
-    // pre-LN + Q for self
-    var a: array<f32, D>;
-    for (var i = 0u; i < D; i++) {a[i] = x[i];}
-    layernorm(&a, lo + L0_LN0G, lo + L0_LN0B);
-    var q: array<f32, D>;
-    for (var r = 0u; r < D; r++) {
-        var s = w[lo + L0_QB + r];
+    let base = BLOCK_BASE + layer_params.layer * BLOCK_SIZE;
+    let to_tokens_b = (layer_params.layer & 1u) == 0u;
+    var x: array<f32, MODEL_DIM>;
+    load_token(token_index, to_tokens_b, &x);
 
-        for (var c = 0u; c < D; c++) {s += w[lo + L0_QW + r * D + c] * a[c];}
-        q[r] = ok_f(s);
+    var normalized: array<f32, MODEL_DIM>;
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        normalized[i] = x[i];
+    }
+    rmsnorm(&normalized, base + B_ATTN_GAIN);
+
+    var query_token: array<f32, MODEL_DIM>;
+    for (var r = 0u; r < MODEL_DIM; r++) {
+        var sum = weights[base + B_QUERY_BIAS + r];
+        for (var c = 0u; c < MODEL_DIM; c++) {
+            sum += weights[base + B_QUERY_WEIGHTS + r * MODEL_DIM + c] * normalized[c];
+        }
+        query_token[r] = sanitize(sum);
     }
 
-    let scale = inverseSqrt(f32(HD));
-    var att: array<f32, D>;
-    for (var h = 0u; h < NH; h++) {
-        let base = h * HD;
-        var s: array<f32, NP>;
-        var mx = -3.4028235e38;
-        for (var j = 0u; j < NP; j++) {
-            var aj: array<f32, D>;
-            load_tok(j, src_to_b, &aj);
-            layernorm(&aj, lo + L0_LN0G, lo + L0_LN0B);
-            var kj: array<f32, D>;
-            for (var r = 0u; r < D; r++) {
-                var sum = w[lo + L0_KB + r];
-                for (var c = 0u; c < D; c++) {
-                    sum += w[lo + L0_KW + r * D + c] * aj[c];
+    let scale = inverseSqrt(f32(HEAD_DIM));
+    var attended: array<f32, MODEL_DIM>;
+    for (var head = 0u; head < HEAD_COUNT; head++) {
+        let head_base = head * HEAD_DIM;
+        var scores: array<f32, PATCH_COUNT>;
+        var max_score = -3.4028235e38;
+        for (var j = 0u; j < PATCH_COUNT; j++) {
+            var key_source: array<f32, MODEL_DIM>;
+            load_token(j, to_tokens_b, &key_source);
+            rmsnorm(&key_source, base + B_ATTN_GAIN);
+            var key: array<f32, MODEL_DIM>;
+            for (var r = 0u; r < MODEL_DIM; r++) {
+                var sum = weights[base + B_KEY_BIAS + r];
+                for (var c = 0u; c < MODEL_DIM; c++) {
+                    sum += weights[base + B_KEY_WEIGHTS + r * MODEL_DIM + c] * key_source[c];
                 }
-                kj[r] = ok_f(sum);
+                key[r] = sanitize(sum);
             }
-            var d = 0.0;
-            for (var t = 0u; t < HD; t++) {d += q[base + t] * kj[base + t];}
-            s[j] = d * scale;
-            if (s[j] > mx) {mx = s[j];}
+            var dot = 0.0;
+            for (var t = 0u; t < HEAD_DIM; t++) {
+                dot += query_token[head_base + t] * key[head_base + t];
+            }
+            scores[j] = dot * scale;
+            if (scores[j] > max_score) {
+                max_score = scores[j];
+            }
         }
-        var z = 0.0;
-        for (var j = 0u; j < NP; j++) {
-            s[j] = exp(s[j] - mx);
-            z += s[j];
+        var total = 0.0;
+        for (var j = 0u; j < PATCH_COUNT; j++) {
+            scores[j] = exp(scores[j] - max_score);
+            total += scores[j];
         }
-        let inv = 1.0 / max(z, 1e-8);
-        var acc: array<f32, HD>;
-        for (var t = 0u; t < HD; t++) {
-            acc[t] = 0.0;
+        let inv_total = 1.0 / max(total, 1e-8);
+        var sum_head: array<f32, HEAD_DIM>;
+        for (var t = 0u; t < HEAD_DIM; t++) {
+            sum_head[t] = 0.0;
         }
-        for (var j = 0u; j < NP; j++) {
-            var aj: array<f32, D>;
-            load_tok(j, src_to_b, &aj);
-            layernorm(&aj, lo + L0_LN0G, lo + L0_LN0B);
-            var vj: array<f32, D>;
-            for (var r = 0u; r < D; r++) {
-                var sum = w[lo + L0_VB + r];
-                for (var c = 0u; c < D; c++) {
-                    sum += w[lo + L0_VW + r * D + c] * aj[c];
+        for (var j = 0u; j < PATCH_COUNT; j++) {
+            var value_source: array<f32, MODEL_DIM>;
+            load_token(j, to_tokens_b, &value_source);
+            rmsnorm(&value_source, base + B_ATTN_GAIN);
+            var value: array<f32, MODEL_DIM>;
+            for (var r = 0u; r < MODEL_DIM; r++) {
+                var sum = weights[base + B_VALUE_BIAS + r];
+                for (var c = 0u; c < MODEL_DIM; c++) {
+                    sum += weights[base + B_VALUE_WEIGHTS + r * MODEL_DIM + c] * value_source[c];
                 }
-                vj[r] = ok_f(sum);
+                value[r] = sanitize(sum);
             }
-            let wj = s[j] * inv;
-            for (var t = 0u; t < HD; t++) {
-                acc[t] += wj * vj[base + t];
+            let score = scores[j] * inv_total;
+            for (var t = 0u; t < HEAD_DIM; t++) {
+                sum_head[t] += score * value[head_base + t];
             }
         }
-        for (var t = 0u; t < HD; t++) {
-            att[base + t] = acc[t];
+        for (var t = 0u; t < HEAD_DIM; t++) {
+            attended[head_base + t] = sum_head[t];
         }
     }
 
-    for (var r = 0u; r < D; r++) {
-        var s = w[lo + L0_OB + r];
-        for (var c = 0u; c < D; c++) {
-            s += w[lo + L0_OW + r * D + c] * att[c];
+    for (var r = 0u; r < MODEL_DIM; r++) {
+        var sum = weights[base + B_OUT_BIAS + r];
+        for (var c = 0u; c < MODEL_DIM; c++) {
+            sum += weights[base + B_OUT_WEIGHTS + r * MODEL_DIM + c] * attended[c];
         }
-        x[r] += ok_f(s);
+        x[r] += sanitize(sum);
     }
 
-    var h: array<f32, D>;
-    for (var i = 0u; i < D; i++) {
-        h[i] = x[i];
+    var ffn_input: array<f32, MODEL_DIM>;
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        ffn_input[i] = x[i];
     }
-    layernorm(&h, lo + L0_LN1G, lo + L0_LN1B);
+    rmsnorm(&ffn_input, base + B_FFN_GAIN);
 
-    var hid: array<f32, FF>;
-    for (var r = 0u; r < FF; r++) {
-        var s = w[lo + L0_F0B + r];
-        for (var c = 0u; c < D; c++) {
-            s += w[lo + L0_F0W + r * D + c] * h[c];
+    var hidden: array<f32, FFN_DIM>;
+    for (var r = 0u; r < FFN_DIM; r++) {
+        var sum = weights[base + B_FFN_IN_BIAS + r];
+        for (var c = 0u; c < MODEL_DIM; c++) {
+            sum += weights[base + B_FFN_IN_WEIGHTS + r * MODEL_DIM + c] * ffn_input[c];
         }
-        hid[r] = gelu(ok_f(s));
+        hidden[r] = gelu(sanitize(sum));
     }
-    for (var r = 0u; r < D; r++) {
-        var s = w[lo + L0_F1B + r];
-        for (var c = 0u; c < FF; c++) {
-            s += w[lo + L0_F1W + r * FF + c] * hid[c];
+    for (var r = 0u; r < MODEL_DIM; r++) {
+        var sum = weights[base + B_FFN_OUT_BIAS + r];
+        for (var c = 0u; c < FFN_DIM; c++) {
+            sum += weights[base + B_FFN_OUT_WEIGHTS + r * FFN_DIM + c] * hidden[c];
         }
-        x[r] += ok_f(s);
+        x[r] += sanitize(sum);
     }
 
-    for (var i = 0u; i < D; i++) {
+    for (var i = 0u; i < MODEL_DIM; i++) {
         if (x[i] != x[i]) {
             x[i] = 0.0;
         }
-        if (src_to_b) {
-            tkb[ti * D + i] = x[i];
+        if (to_tokens_b) {
+            tokens_b[token_index * MODEL_DIM + i] = x[i];
         } else {
-            tk[ti * D + i] = x[i];
+            tokens_a[token_index * MODEL_DIM + i] = x[i];
         }
     }
 }
 
-// p._p0 == 1 => final tokens live in tkb (NL odd); else tk (NL even)
+// Per-note query: cross-attend over the visual tokens, then classify the fused
+// query/context pair. `layer_params.final_in_second` selects the final buffer.
 @compute @workgroup_size(64)
-fn qry(@builtin(global_invocation_id) id: vec3<u32>) {
-    let qi = id.x;
-    if (qi >= p.nq || qi * NF >= arrayLength(&qin)) {return;}
-    let pk = qp[qi];
-    let fbase = qi * NF;
-    let src_b = p._p0 == 1u;
+fn classify(@builtin(global_invocation_id) id: vec3<u32>) {
+    let query_index = id.x;
+    if (query_index >= layer_params.query_count
+        || query_index * NOTE_FEATURE_DIM >= arrayLength(&query_features)) {
+        return;
+    }
+    let patch_id = query_patches[query_index];
+    let feature_base = query_index * NOTE_FEATURE_DIM;
+    let in_second = layer_params.final_in_second == 1u;
 
-    var raw: array<f32, NF>;
-    for (var i = 0u; i < NF; i++) {raw[i] = qin[fbase + i];}
-
-    var qt: array<f32, D>;
-    for (var r = 0u; r < D; r++) {
-        var s = w[OFF_NEB + r];
-        for (var c = 0u; c < NF; c++) {
-            s += w[OFF_NE + r * NF + c] * raw[c];
-        }
-        let pos = w[OFF_POS + pk * D + r] * 0.15;
-        qt[r] = ok_f(s) + pos;
+    var features: array<f32, NOTE_FEATURE_DIM>;
+    for (var i = 0u; i < NOTE_FEATURE_DIM; i++) {
+        features[i] = query_features[feature_base + i];
     }
 
-    var ctx: array<f32, D>;
-    for (var i = 0u; i < D; i++) {ctx[i] = qt[i];}
+    var query_token: array<f32, MODEL_DIM>;
+    for (var r = 0u; r < MODEL_DIM; r++) {
+        var sum = weights[OFF_NOTE_BIAS + r];
+        for (var c = 0u; c < NOTE_FEATURE_DIM; c++) {
+            sum += weights[OFF_NOTE_WEIGHTS + r * NOTE_FEATURE_DIM + c] * features[c];
+        }
+        query_token[r] = sanitize(sum) + weights[OFF_POSITIONAL + patch_id * MODEL_DIM + r] * 0.15;
+    }
 
-    for (var li = 0u; li < NL; li++) {
-        let lo = LAY0 + li * LAY_SZ;
-        var qn: array<f32, D>;
-        for (var i = 0u; i < D; i++) {qn[i] = qt[i];}
-        layernorm(&qn, lo + L0_LN0G, lo + L0_LN0B);
+    var context: array<f32, MODEL_DIM>;
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        context[i] = query_token[i];
+    }
 
-        var ql: array<f32, D>;
-        for (var r = 0u; r < D; r++) {
-            var s = w[lo + L0_QB + r];
-            for (var c = 0u; c < D; c++) {
-                s += w[lo + L0_QW + r * D + c] * qn[c];
+    for (var layer = 0u; layer < BLOCK_COUNT; layer++) {
+        let base = BLOCK_BASE + layer * BLOCK_SIZE;
+        var normalized: array<f32, MODEL_DIM>;
+        for (var i = 0u; i < MODEL_DIM; i++) {
+            normalized[i] = query_token[i];
+        }
+        rmsnorm(&normalized, base + B_ATTN_GAIN);
+
+        var projected_query: array<f32, MODEL_DIM>;
+        for (var r = 0u; r < MODEL_DIM; r++) {
+            var sum = weights[base + B_QUERY_BIAS + r];
+            for (var c = 0u; c < MODEL_DIM; c++) {
+                sum += weights[base + B_QUERY_WEIGHTS + r * MODEL_DIM + c] * normalized[c];
             }
-            ql[r] = ok_f(s);
+            projected_query[r] = sanitize(sum);
         }
 
-        let scale = inverseSqrt(f32(HD));
-        var o: array<f32, D>;
-        for (var h = 0u; h < NH; h++) {
-            let base = h * HD;
-            var sh: array<f32, NP>;
-            var mxh = -3.4028235e38;
-            for (var j = 0u; j < NP; j++) {
-                var kj: array<f32, D>;
-                for (var r = 0u; r < D; r++) {
-                    var sk = w[lo + L0_KB + r];
-                    for (var c = 0u; c < D; c++) {
-                        let tv = select(tk[j * D + c], tkb[j * D + c], src_b);
-                        sk += w[lo + L0_KW + r * D + c] * tv;
+        let scale = inverseSqrt(f32(HEAD_DIM));
+        var attention_out: array<f32, MODEL_DIM>;
+        for (var head = 0u; head < HEAD_COUNT; head++) {
+            let head_base = head * HEAD_DIM;
+            var scores: array<f32, PATCH_COUNT>;
+            var max_score = -3.4028235e38;
+            for (var j = 0u; j < PATCH_COUNT; j++) {
+                var key: array<f32, MODEL_DIM>;
+                for (var r = 0u; r < MODEL_DIM; r++) {
+                    var sum = weights[base + B_KEY_BIAS + r];
+                    for (var c = 0u; c < MODEL_DIM; c++) {
+                        let token = select(tokens_a[j * MODEL_DIM + c], tokens_b[j * MODEL_DIM + c], in_second);
+                        sum += weights[base + B_KEY_WEIGHTS + r * MODEL_DIM + c] * token;
                     }
-                    kj[r] = ok_f(sk);
+                    key[r] = sanitize(sum);
                 }
-                var d = 0.0;
-                for (var t = 0u; t < HD; t++) {
-                    d += ql[base + t] * kj[base + t];
+                var dot = 0.0;
+                for (var t = 0u; t < HEAD_DIM; t++) {
+                    dot += projected_query[head_base + t] * key[head_base + t];
                 }
-                sh[j] = d * scale;
-                if (sh[j] > mxh) {
-                    mxh = sh[j];
+                scores[j] = dot * scale;
+                if (scores[j] > max_score) {
+                    max_score = scores[j];
                 }
             }
-            var zh = 0.0;
-            for (var j = 0u; j < NP; j++) {
-                sh[j] = exp(sh[j] - mxh);
-                zh += sh[j];
+            var total = 0.0;
+            for (var j = 0u; j < PATCH_COUNT; j++) {
+                scores[j] = exp(scores[j] - max_score);
+                total += scores[j];
             }
-            let invh = 1.0 / max(zh, 1e-8);
-            var acch: array<f32, HD>;
-            for (var t = 0u; t < HD; t++) {
-                acch[t] = 0.0;
+            let inv_total = 1.0 / max(total, 1e-8);
+            var sum_head: array<f32, HEAD_DIM>;
+            for (var t = 0u; t < HEAD_DIM; t++) {
+                sum_head[t] = 0.0;
             }
-            for (var j = 0u; j < NP; j++) {
-                var vj: array<f32, D>;
-                for (var r = 0u; r < D; r++) {
-                    var sv = w[lo + L0_VB + r];
-                    for (var c = 0u; c < D; c++) {
-                        let tv = select(tk[j * D + c], tkb[j * D + c], src_b);
-                        sv += w[lo + L0_VW + r * D + c] * tv;
+            for (var j = 0u; j < PATCH_COUNT; j++) {
+                var value: array<f32, MODEL_DIM>;
+                for (var r = 0u; r < MODEL_DIM; r++) {
+                    var sum = weights[base + B_VALUE_BIAS + r];
+                    for (var c = 0u; c < MODEL_DIM; c++) {
+                        let token = select(tokens_a[j * MODEL_DIM + c], tokens_b[j * MODEL_DIM + c], in_second);
+                        sum += weights[base + B_VALUE_WEIGHTS + r * MODEL_DIM + c] * token;
                     }
-                    vj[r] = ok_f(sv);
+                    value[r] = sanitize(sum);
                 }
-                let wj = sh[j] * invh;
-                for (var t = 0u; t < HD; t++) {
-                    acch[t] += wj * vj[base + t];
+                let score = scores[j] * inv_total;
+                for (var t = 0u; t < HEAD_DIM; t++) {
+                    sum_head[t] += score * value[head_base + t];
                 }
             }
-            for (var t = 0u; t < HD; t++) {
-                o[base + t] = acch[t];
+            for (var t = 0u; t < HEAD_DIM; t++) {
+                attention_out[head_base + t] = sum_head[t];
             }
         }
 
-        var pr: array<f32, D>;
-        for (var r = 0u; r < D; r++) {
-            var s = w[lo + L0_OB + r];
-            for (var c = 0u; c < D; c++) {
-                s += w[lo + L0_OW + r * D + c] * o[c];
+        var projected: array<f32, MODEL_DIM>;
+        for (var r = 0u; r < MODEL_DIM; r++) {
+            var sum = weights[base + B_OUT_BIAS + r];
+            for (var c = 0u; c < MODEL_DIM; c++) {
+                sum += weights[base + B_OUT_WEIGHTS + r * MODEL_DIM + c] * attention_out[c];
             }
-            pr[r] = ok_f(s);
+            projected[r] = sanitize(sum);
         }
 
-        // CPU: ctx = xa(qt) = qt + proj; qt = 0.5*qt + 0.5*ctx
-        var nxt: array<f32, D>;
-        for (var i = 0u; i < D; i++) {
-            nxt[i] = qt[i] * 0.5 + (qt[i] + pr[i]) * 0.5;
-        }
-        for (var i = 0u; i < D; i++) {
-            qt[i] = nxt[i];
-            ctx[i] = qt[i];
+        for (var i = 0u; i < MODEL_DIM; i++) {
+            query_token[i] = query_token[i] * 0.5 + (query_token[i] + projected[i]) * 0.5;
+            context[i] = query_token[i];
         }
     }
 
-    var fus: array<f32, QD>;
-    for (var i = 0u; i < D; i++) {
-        fus[i] = qt[i];
-        fus[D + i] = ctx[i];
+    var fused: array<f32, FUSED_DIM>;
+    for (var i = 0u; i < MODEL_DIM; i++) {
+        fused[i] = query_token[i];
+        fused[MODEL_DIM + i] = context[i];
     }
-    var lg = w[OFF_FC + QD];
-    for (var c = 0u; c < QD; c++) {
-        lg += w[OFF_FC + c] * fus[c];
+    var logit = weights[OFF_CLASSIFIER + FUSED_DIM];
+    for (var c = 0u; c < FUSED_DIM; c++) {
+        logit += weights[OFF_CLASSIFIER + c] * fused[c];
     }
-    if (lg != lg) {
-        lg = 0.0;
+    if (logit != logit) {
+        logit = 0.0;
     }
-    out[qi] = lg;
+    logits[query_index] = logit;
 }
