@@ -407,19 +407,28 @@ fn bytes_to_text_auto(data: &[u8]) -> String {
 }
 
 pub async fn load_info(fs: &mut dyn FileSystem) -> Result<ChartInfo> {
-    let info = if let Ok(bytes) = fs.load_file(":info").await {
-        serde_yaml::from_str(&bytes_to_text_auto(&bytes))?
-    } else if let Ok(bytes) = fs.load_file("info.yml").await {
-        serde_yaml::from_str(&bytes_to_text_auto(&bytes))?
-    } else if let Ok(bytes) = fs.load_file("info.txt").await {
-        info_from_txt(&bytes_to_text_auto(&bytes))?
-    } else if let Ok(bytes) = fs.load_file("info.csv").await {
-        info_from_csv(&bytes_to_text_auto(&bytes))?
-    } else {
-        warn!("none of info.yml, info.txt and info.csv is found, inferring");
-        let mut info = ChartInfo::default();
-        fix_info(fs, &mut info).await?;
-        info
+    let mut info_opt = None;
+    for filename in &[":info", "info.yml", "info.txt", "info.csv"] {
+        if let Ok(bytes) = fs.load_file(filename).await {
+            let text = bytes_to_text_auto(&bytes);
+            info_opt = Some(match *filename {
+                ":info" | "info.yml" => serde_yaml::from_str(&text)?,
+                "info.txt" => info_from_txt(&text)?,
+                "info.csv" => info_from_csv(&text)?,
+                _ => unreachable!(),
+            });
+            break;
+        }
+    }
+
+    let info = match info_opt {
+        Some(info) => info,
+        None => {
+            warn!("none of info.yml, info.txt and info.csv is found, inferring");
+            let mut info = ChartInfo::default();
+            fix_info(fs, &mut info).await?;
+            info
+        }
     };
     Ok(info)
 }
