@@ -33,7 +33,7 @@ thread_local! {
     static RANGES: RefCell<FlatRanges> = RefCell::new(FlatRanges::default());
 }
 
-pub(super) fn draw(aspect: f32, zones: &[Zone], disabled: bool) {
+pub fn draw(aspect: f32, zones: &[Zone], disabled: bool) {
     RANGES.with(|cached| {
         let mut cached = cached.borrow_mut();
         if cached.aspect != aspect || cached.zones != zones {
