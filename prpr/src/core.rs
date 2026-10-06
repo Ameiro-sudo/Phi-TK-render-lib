@@ -13,18 +13,20 @@ mod anim;
 pub use anim::{Anim, AnimFloat, AnimVector, Keyframe};
 
 // ---- Phigros 9th-chapter block areas ("噪域" / noise field) ----
-// Ported from Phira-Pro/Phira-Pro (GPL-3.0). Only the flat CPU renderer is
-// wired up: the GPU mask/shader path is intentionally omitted.
+// Ported from Phira-Pro/Phira-Pro (GPL-3.0). `block_shader` owns the GPU mask
+// and shader path (the official look) plus the flat CPU fallback it falls back
+// to when a material cannot be built.
 mod block;
 pub use block::{
     block_touch_blocked, touch_inset_world, BlockArea, BlockMoveEvent, BlockPhase, BlockRotateEvent,
     BlockScaleEvent, BlockTransform,
 };
-mod block_zone;
-pub use block_zone::Zone;
+mod block_shader;
+pub use block_shader::{draw_disabled_zones, draw_zones, draw_zones_with_touches, Zone};
+pub(crate) use block_shader::{
+    clear_prepared_block_geometry, prepare_block_effects, prepare_block_geometry, reset_block_effects,
+};
 mod block_timeline;
-mod block_simple;
-pub(crate) use block_simple::draw as draw_block_zones_simple;
 
 mod chart;
 pub use chart::{Chart, ChartExtra, ChartSettings};

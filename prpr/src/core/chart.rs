@@ -1,5 +1,6 @@
 use super::{
-    draw_block_zones_simple, BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video, Zone,
+    draw_disabled_zones, draw_zones_with_touches, BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix,
+    Resource, UIElement, Vector, Video, Zone,
 };
 use crate::{fs::FileSystem, judge::JudgeStatus, ui::Ui};
 use anyhow::{Context, Result};
@@ -120,6 +121,8 @@ impl Chart {
     }
 
     pub fn reset(&mut self) {
+        self.block_frame.get_mut().key = None;
+        super::reset_block_effects();
         self.lines
             .iter_mut()
             .flat_map(|it| it.notes.iter_mut())
@@ -183,6 +186,12 @@ impl Chart {
             }
         });
         res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if res.config.flip_x() { -1. } else { 1. }, -1.)), |res| {
+            // 噪域 Disabled layer: native Background sorting layer order 2,
+            // judge lines are order 3 — so it goes *before* the lines.
+            if !self.block_areas.is_empty() {
+                let zones = self.block_zones(res);
+                draw_disabled_zones(res, res.aspect_ratio, &zones);
+            }
             let guard = self.bpm_list.borrow();
             for id in &self.order {
                 self.lines[*id].render(ui, res, &self.lines, &guard, &self.settings, *id);
@@ -198,20 +207,24 @@ impl Chart {
         });
     }
 
-    /// Draw the 噪域 (`blockAreaList`) rectangles of the current frame.
-    ///
-    /// Uses the flat CPU tessellator rather than Phira Pro's GPU mask/shader
-    /// path: identical geometry, no render-target copies, deterministic output,
-    /// which is what an offline video render needs.
+    /// Official `ActiveBlock` runs at `CameraEvent::AfterForwardAlpha`, i.e. as
+    /// postprocessing after sprites, notes and HUD. Touch centres are absent
+    /// here: an offline render has no fingers, and the port does not implement
+    /// 噪域触摸感染.
     pub fn render_block_overlay(&self, res: &mut Resource) {
         if self.block_areas.is_empty() {
             return;
         }
-        let aspect = res.aspect_ratio;
-        {
-            let zones = self.block_zones(res);
-            draw_block_zones_simple(aspect, &zones, false);
-        }
+        let flip_x = res.config.flip_x();
+        let zones = self.block_zones(res);
+        res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if flip_x { -1. } else { 1. }, -1.)), |res| {
+            draw_zones_with_touches(res, res.aspect_ratio, &zones, &[], flip_x);
+        });
+    }
+
+    /// Whether this chart has any 噪域 at all (used to pre-link the shaders).
+    pub fn has_block_areas(&self) -> bool {
+        !self.block_areas.is_empty()
     }
 
     fn block_zones(&self, res: &Resource) -> std::cell::Ref<'_, [Zone]> {

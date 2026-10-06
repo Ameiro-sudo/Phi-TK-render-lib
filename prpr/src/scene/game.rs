@@ -639,6 +639,11 @@ impl GameScene {
             _ => {}
         }
         let (mut chart, chart_bytes, chart_format) = Self::load_chart(fs.deref_mut(), &info).await?;
+        // Link the 噪域 shaders and decode their noise textures now, before a
+        // late first block would stall a live judgement frame.
+        if chart.has_block_areas() && !config.block_area_simple {
+            crate::core::prepare_block_effects();
+        }
         let effects = std::mem::take(&mut chart.extra.global_effects);
         if config.fxaa {
             chart
@@ -665,6 +670,7 @@ impl GameScene {
         let judge = Judge::new(&chart);
 
         let music = Self::new_music(&mut res)?;
+        crate::core::reset_block_effects();
 
         let chart_ratio = res.config.chart_ratio;
         let judgement_counters = vec![

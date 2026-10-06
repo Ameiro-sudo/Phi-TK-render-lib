@@ -86,6 +86,10 @@ pub struct Config {
     pub bar: bool,
     pub combo_anim: bool,
     pub emitting: bool,
+    /// 噪域 (`blockAreaList`) renderer. `false` = the GPU shader path (the
+    /// official look: torn/noised mask, glowing rim, sparkles); `true` = the
+    /// flat CPU path used for low-end devices. Phira Pro ships `false`.
+    pub block_area_simple: bool,
 
     // for compatibility
     pub autoplay: Option<bool>,
@@ -151,6 +155,7 @@ impl Default for Config {
             bar: true,
             combo_anim: false,
             emitting: false,
+            block_area_simple: false,
 
             ui_score: true,
             ui_combo: true,

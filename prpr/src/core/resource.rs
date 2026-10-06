@@ -430,6 +430,9 @@ pub struct Resource {
     pub emitter: ParticleEmitter,
 
     pub chart_target: Option<MSRenderTarget>,
+    /// Render passes the 噪域 shader path has already probed, and whether the
+    /// probe said the pass may legally be blitted as a snapshot source.
+    pub(crate) snapshot_blit_sources: Vec<(miniquad::RenderPass, bool)>,
     pub no_effect: bool,
 
     pub note_buffer: RefCell<NoteBuffer>,
@@ -563,6 +566,7 @@ impl Resource {
             sfx_flick,
 
             chart_target: None,
+            snapshot_blit_sources: Vec::new(),
             no_effect,
 
             note_buffer: RefCell::new(NoteBuffer::default()),
@@ -594,6 +598,7 @@ impl Resource {
             return false;
         }
         if !self.no_effect || self.config.sample_count != 1 {
+            self.snapshot_blit_sources.clear();
             self.chart_target = Some(MSRenderTarget::new(
                 (width as u32, height as u32),
                 self.config.sample_count
