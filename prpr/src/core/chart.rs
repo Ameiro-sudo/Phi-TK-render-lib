@@ -11,7 +11,8 @@ use tracing::warn;
 #[derive(Default)]
 struct BlockFrame {
     timeline: super::block_timeline::BlockTimeline,
-    key: Option<(f64, f32, usize)>,
+    // `Resource::time` is an f32 in this fork, so the cache key is f32 too.
+    key: Option<(f32, f32, usize)>,
     zones: Vec<Zone>,
 }
 
@@ -214,6 +215,9 @@ impl Chart {
     }
 
     fn block_zones(&self, res: &Resource) -> std::cell::Ref<'_, [Zone]> {
+        // The block module works in seconds (f64); this fork's `Resource::time`
+        // is an f32, so widen once here.
+        let now = res.time as f64;
         let key = (res.time, res.aspect_ratio, self.block_areas.len());
         {
             let mut cache = self.block_frame.borrow_mut();
@@ -222,9 +226,9 @@ impl Chart {
                 zones.clear();
                 zones.extend(
                     timeline
-                        .at(&self.block_areas, res.time)
+                        .at(&self.block_areas, now)
                         .iter()
-                        .filter_map(|&id| Zone::from_area(&self.block_areas[id], res.time, res.aspect_ratio)),
+                        .filter_map(|&id| Zone::from_area(&self.block_areas[id], now, res.aspect_ratio)),
                 );
                 cache.key = Some(key);
             }
