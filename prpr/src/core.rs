@@ -23,7 +23,6 @@ pub use block::{
 mod block_zone;
 pub use block_zone::Zone;
 mod block_timeline;
-#[path = "block_simple.rs"]
 mod block_simple;
 pub(crate) use block_simple::draw as draw_block_zones_simple;
 
