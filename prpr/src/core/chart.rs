@@ -1,9 +1,19 @@
-use super::{BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video};
+use super::{
+    draw_block_zones_simple, BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video, Zone,
+};
 use crate::{fs::FileSystem, judge::JudgeStatus, ui::Ui};
 use anyhow::{Context, Result};
 use macroquad::prelude::*;
 use std::cell::RefCell;
 use tracing::warn;
+
+/// Per-frame cache of the resolved 噪域 rectangles.
+#[derive(Default)]
+struct BlockFrame {
+    timeline: super::block_timeline::BlockTimeline,
+    key: Option<(f64, f32, usize)>,
+    zones: Vec<Zone>,
+}
 
 //use rayon::prelude::*;
 
@@ -28,6 +38,9 @@ pub struct Chart {
     pub extra: ChartExtra,
     pub order: Vec<usize>,
     pub attach_ui: [Option<usize>; 7],
+    /// Phigros 9th-chapter 噪域 (`blockAreaList`). Empty for every older chart.
+    pub block_areas: Vec<BlockArea>,
+    block_frame: RefCell<BlockFrame>,
     world_positions: Vec<Vector>,
     trs: Vec<Matrix>,
 }
@@ -56,6 +69,8 @@ impl Chart {
 
             order,
             attach_ui,
+            block_areas: Vec::new(),
+            block_frame: RefCell::default(),
             world_positions: Vec::with_capacity(capacity),
             trs: Vec::with_capacity(capacity),
         }
@@ -180,5 +195,40 @@ impl Chart {
                 }
             }
         });
+    }
+
+    /// Draw the 噪域 (`blockAreaList`) rectangles of the current frame.
+    ///
+    /// Uses the flat CPU tessellator rather than Phira Pro's GPU mask/shader
+    /// path: identical geometry, no render-target copies, deterministic output,
+    /// which is what an offline video render needs.
+    pub fn render_block_overlay(&self, res: &mut Resource) {
+        if self.block_areas.is_empty() {
+            return;
+        }
+        let aspect = res.aspect_ratio;
+        {
+            let zones = self.block_zones(res);
+            draw_block_zones_simple(aspect, &zones, false);
+        }
+    }
+
+    fn block_zones(&self, res: &Resource) -> std::cell::Ref<'_, [Zone]> {
+        let key = (res.time, res.aspect_ratio, self.block_areas.len());
+        {
+            let mut cache = self.block_frame.borrow_mut();
+            if cache.key != Some(key) {
+                let BlockFrame { timeline, zones, .. } = &mut *cache;
+                zones.clear();
+                zones.extend(
+                    timeline
+                        .at(&self.block_areas, res.time)
+                        .iter()
+                        .filter_map(|&id| Zone::from_area(&self.block_areas[id], res.time, res.aspect_ratio)),
+                );
+                cache.key = Some(key);
+            }
+        }
+        std::cell::Ref::map(self.block_frame.borrow(), |cache| cache.zones.as_slice())
     }
 }
