@@ -510,10 +510,11 @@ impl Scene for EndingScene {
 
         // ---- end-of-render diagnostic probe (temporary) ----
         {
-            // Matches the call style already used in block_shader.rs:312.
-            unsafe { macroquad::graphics::get_internal_gl() }.flush();
+            // `get_internal_gl` arrives through `use macroquad::prelude::*;`;
+            // `macroquad::graphics` is a private module in this fork.
+            unsafe { get_internal_gl() }.flush();
             unsafe {
-                use macroquad::miniquad::gl::*;
+                use miniquad::gl::*;
                 // Raw values: this miniquad fork's desktop GL constant table is
                 // missing several of these, and a missing name is a hard error.
                 let gl_att_width: u32 = 0x8CE0;
