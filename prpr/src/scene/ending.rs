@@ -227,31 +227,23 @@ impl Scene for EndingScene {
 
     fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()> {
 
-        // TEMP DIAGNOSTIC (noise-port): dump the GL state the ending scene
-        // inherits. The delivery build clips the whole page at x=1280.
+        // TEMP DIAGNOSTIC (noise-port): the delivery build clips the whole
+        // ending page at x=1280. Dump everything that feeds the camera.
         {
             use std::cell::Cell;
             thread_local! { static DBG: Cell<u64> = const { Cell::new(0) }; }
             let n = DBG.with(|c| { let v = c.get() + 1; c.set(v); v });
             if n % 60 == 1 {
-                use miniquad::gl::*;
-                // This fork's desktop table lacks the state-query constants.
-                const V_VIEWPORT: u32 = 0x0BA2;
-                const V_SCISSOR_BOX: u32 = 0x0C10;
-                unsafe {
-                    let mut vp = [0i32; 4];
-                    let mut sb = [0i32; 4];
-                    let mut st = 0i32;
-                    let mut fb = 0i32;
-                    glGetIntegerv(V_VIEWPORT, vp.as_mut_ptr());
-                    glGetIntegerv(V_SCISSOR_BOX, sb.as_mut_ptr());
-                    glGetIntegerv(0x0C11, &mut st);
-                    glGetIntegerv(0x8CA6, &mut fb);
-                    eprintln!(
-                        "[ending-dbg#{n}] viewport={vp:?} scissor_box={sb:?} scissor_test={st} fbo={fb} t={}",
-                        tm.now()
-                    );
-                }
+                let cam = ui.camera();
+                eprintln!(
+                    "[dbg#{n}:pre] screen={}x{} cam.vp={:?} cam.zoom={:?} asp={} t={}",
+                    screen_width(),
+                    screen_height(),
+                    cam.viewport,
+                    cam.zoom,
+                    -cam.zoom.y,
+                    tm.now()
+                );
             }
         }
 
@@ -273,6 +265,28 @@ impl Scene for EndingScene {
         cam.render_target = self.target;
         set_camera(&cam);
         draw_background(*self.background);
+        {
+            use std::cell::Cell;
+            thread_local! { static DBG2: Cell<u64> = const { Cell::new(0) }; }
+            let m = DBG2.with(|c| { let v = c.get() + 1; c.set(v); v });
+            if m % 60 == 1 {
+                use miniquad::gl::*;
+                // This fork's desktop table lacks the state-query constants.
+                const V_VIEWPORT: u32 = 0x0BA2;
+                const V_SCISSOR_BOX: u32 = 0x0C10;
+                let mut vp = [0i32; 4];
+                let mut sb = [0i32; 4];
+                let mut st = 0i32;
+                let mut fb = 0i32;
+                unsafe {
+                    glGetIntegerv(V_VIEWPORT, vp.as_mut_ptr());
+                    glGetIntegerv(V_SCISSOR_BOX, sb.as_mut_ptr());
+                    glGetIntegerv(0x0C11, &mut st);
+                    glGetIntegerv(0x8CA6, &mut fb);
+                }
+                eprintln!("[dbg#{m}:post] gl.vp={:?} gl.sb={:?} sctest={} fbo={}", vp, sb, st, fb);
+            }
+        }
 
         fn ran(t: f32, l: f32, r: f32) -> f32 {
             ((t - l) / (r - l)).clamp(0., 1.)
