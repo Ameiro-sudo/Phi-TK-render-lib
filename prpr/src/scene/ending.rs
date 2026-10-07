@@ -227,6 +227,31 @@ impl Scene for EndingScene {
 
     fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()> {
 
+        // TEMP DIAGNOSTIC (noise-port): dump the GL state the ending scene
+        // inherits. The delivery build clips the whole page at x=1280.
+        {
+            use std::cell::Cell;
+            thread_local! { static DBG: Cell<u64> = const { Cell::new(0) }; }
+            let n = DBG.with(|c| { let v = c.get() + 1; c.set(v); v });
+            if n % 60 == 1 {
+                use miniquad::gl::*;
+                unsafe {
+                    let mut vp = [0i32; 4];
+                    let mut sb = [0i32; 4];
+                    let mut st = 0i32;
+                    let mut fb = 0i32;
+                    glGetIntegerv(GL_VIEWPORT, vp.as_mut_ptr());
+                    glGetIntegerv(GL_SCISSOR_BOX, sb.as_mut_ptr());
+                    glGetIntegerv(GL_SCISSOR_TEST, &mut st);
+                    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut fb);
+                    eprintln!(
+                        "[ending-dbg#{n}] viewport={vp:?} scissor_box={sb:?} scissor_test={st} fbo={fb} t={}",
+                        tm.now()
+                    );
+                }
+            }
+        }
+
         const START0: f32 = 0.0;
         const END0: f32 = 1.25;
         const START1: f32 = 0.00;

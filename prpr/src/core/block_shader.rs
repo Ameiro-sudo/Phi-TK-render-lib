@@ -327,6 +327,13 @@ pub fn draw_zones(res: &mut Resource, aspect: f32, zones: &[Zone]) {
 }
 
 pub fn draw_disabled_zones(res: &mut Resource, aspect: f32, zones: &[Zone]) {
+    // The flat CPU path must own *both* layers: Pro only short-circuits the
+    // active overlay here, so a `blockAreaSimple` render would still run the
+    // GPU mask pass for the disabled layer and leave its GL state behind.
+    if res.config.block_area_simple {
+        simple::draw(aspect, zones, true);
+        return;
+    }
     // Unity's _Time is constant for all passes in a frame. Chart invokes this
     // before notes even when the disabled layer happens to be empty.
     let time = shader_time();
