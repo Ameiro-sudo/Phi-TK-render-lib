@@ -507,6 +507,56 @@ impl Scene for EndingScene {
             .color(color)
             .draw();
 
+
+        // ---- end-of-render diagnostic probe (temporary) ----
+        {
+            // Matches the call style already used in block_shader.rs:312.
+            unsafe { macroquad::graphics::get_internal_gl() }.flush();
+            unsafe {
+                use macroquad::miniquad::gl::*;
+                // Raw values: this miniquad fork's desktop GL constant table is
+                // missing several of these, and a missing name is a hard error.
+                let gl_att_width: u32 = 0x8CE0;
+                let gl_att_height: u32 = 0x8CE1;
+                let n = {
+                    thread_local! {
+                        static N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+                    }
+                    N.with(|c| {
+                        let v = c.get();
+                        c.set(v + 1);
+                        v
+                    })
+                };
+                if n % 60 == 0 {
+                    const GL_FB_BINDING: u32 = 0x8CA6;
+                    const GL_VIEWPORT: u32 = 0x0BA2;
+                    const GL_SCISSOR_BOX: u32 = 0x0C10;
+                    const GL_SCISSOR_TEST: u32 = 0x0C11;
+                    let mut fbo = 0i32;
+                    glGetIntegerv(GL_FB_BINDING, &mut fbo);
+                    let mut aw = 0i32;
+                    let mut ah = 0i32;
+                    glGetFramebufferAttachmentParameteriv(fbo as u32, gl_att_width, 0x8CD0, &mut aw);
+                    glGetFramebufferAttachmentParameteriv(fbo as u32, gl_att_height, 0x8CD0, &mut ah);
+                    let mut vp = [0i32; 4];
+                    glGetIntegerv(GL_VIEWPORT, vp.as_mut_ptr());
+                    let mut sb = [0i32; 4];
+                    glGetIntegerv(GL_SCISSOR_BOX, sb.as_mut_ptr());
+                    let mut st = 0i32;
+                    glGetIntegerv(GL_SCISSOR_TEST, &mut st);
+                    let err = glGetError();
+                    eprintln!(
+                        "[end#{n}] tgt={} fbo={fbo} att={aw}x{ah} vp={vp:?} sb={sb:?} sctest={st} err={err} screen={}x{}",
+                        self.target.is_some(),
+                        screen_width(),
+                        screen_height()
+                    );
+                }
+            }
+        }
+        // ---- end diagnostic probe ----
+
         Ok(())
     }
 
