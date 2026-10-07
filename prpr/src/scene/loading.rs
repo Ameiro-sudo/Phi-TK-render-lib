@@ -256,10 +256,19 @@ impl Scene for LoadingScene {
 
         let mut r = Rect::new(r.x + r.w * st, r.y, r.w * (en - st), r.h);
         ui.fill_rect(r, WHITE);
+        // Submit the wipe before the scissor moves. `Ui::scissor` is immediate
+        // GL state, yet every draw above is still sitting in the batch buffer,
+        // so the whole frame -- and the next one -- ended up clipped by this
+        // rect, which changes on every frame. The visible symptom was the
+        // top-right "Loading..." shimmer freezing into a stuck, half-erased
+        // smear. Same failure mode as SceneEnding, fixed the same way.
+        unsafe { get_internal_gl() }.flush();
         r.x += dx;
         ui.scissor(Some(r));
         draw_text_aligned(ui, "Loading...", 0.865, top * 0.865, (1., 1.), 0.41, BLACK);
+        unsafe { get_internal_gl() }.flush();
         ui.scissor(None);
+        unsafe { get_internal_gl() }.flush();
 
         if dx != 0. {
             gl.pop_model_matrix();
