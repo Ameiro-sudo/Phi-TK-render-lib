@@ -235,15 +235,18 @@ impl Scene for EndingScene {
             let n = DBG.with(|c| { let v = c.get() + 1; c.set(v); v });
             if n % 60 == 1 {
                 use miniquad::gl::*;
+                // This fork's desktop table lacks the state-query constants.
+                const V_VIEWPORT: u32 = 0x0BA2;
+                const V_SCISSOR_BOX: u32 = 0x0C10;
                 unsafe {
                     let mut vp = [0i32; 4];
                     let mut sb = [0i32; 4];
                     let mut st = 0i32;
                     let mut fb = 0i32;
-                    glGetIntegerv(GL_VIEWPORT, vp.as_mut_ptr());
-                    glGetIntegerv(GL_SCISSOR_BOX, sb.as_mut_ptr());
-                    glGetIntegerv(GL_SCISSOR_TEST, &mut st);
-                    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut fb);
+                    glGetIntegerv(V_VIEWPORT, vp.as_mut_ptr());
+                    glGetIntegerv(V_SCISSOR_BOX, sb.as_mut_ptr());
+                    glGetIntegerv(0x0C11, &mut st);
+                    glGetIntegerv(0x8CA6, &mut fb);
                     eprintln!(
                         "[ending-dbg#{n}] viewport={vp:?} scissor_box={sb:?} scissor_test={st} fbo={fb} t={}",
                         tm.now()
