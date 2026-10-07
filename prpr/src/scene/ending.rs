@@ -227,26 +227,6 @@ impl Scene for EndingScene {
 
     fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()> {
 
-        // TEMP DIAGNOSTIC (noise-port): the delivery build clips the whole
-        // ending page at x=1280. Dump everything that feeds the camera.
-        {
-            use std::cell::Cell;
-            thread_local! { static DBG: Cell<u64> = const { Cell::new(0) }; }
-            let n = DBG.with(|c| { let v = c.get() + 1; c.set(v); v });
-            if n % 60 == 1 {
-                let cam = ui.camera();
-                eprintln!(
-                    "[dbg#{n}:pre] screen={}x{} cam.vp={:?} cam.zoom={:?} asp={} t={}",
-                    screen_width(),
-                    screen_height(),
-                    cam.viewport,
-                    cam.zoom,
-                    -cam.zoom.y,
-                    tm.now()
-                );
-            }
-        }
-
         const START0: f32 = 0.0;
         const END0: f32 = 1.25;
         const START1: f32 = 0.00;
@@ -265,28 +245,6 @@ impl Scene for EndingScene {
         cam.render_target = self.target;
         set_camera(&cam);
         draw_background(*self.background);
-        {
-            use std::cell::Cell;
-            thread_local! { static DBG2: Cell<u64> = const { Cell::new(0) }; }
-            let m = DBG2.with(|c| { let v = c.get() + 1; c.set(v); v });
-            if m % 60 == 1 {
-                use miniquad::gl::*;
-                // This fork's desktop table lacks the state-query constants.
-                const V_VIEWPORT: u32 = 0x0BA2;
-                const V_SCISSOR_BOX: u32 = 0x0C10;
-                let mut vp = [0i32; 4];
-                let mut sb = [0i32; 4];
-                let mut st = 0i32;
-                let mut fb = 0i32;
-                unsafe {
-                    glGetIntegerv(V_VIEWPORT, vp.as_mut_ptr());
-                    glGetIntegerv(V_SCISSOR_BOX, sb.as_mut_ptr());
-                    glGetIntegerv(0x0C11, &mut st);
-                    glGetIntegerv(0x8CA6, &mut fb);
-                }
-                eprintln!("[dbg#{m}:post] gl.vp={:?} gl.sb={:?} sctest={} fbo={}", vp, sb, st, fb);
-            }
-        }
 
         fn ran(t: f32, l: f32, r: f32) -> f32 {
             ((t - l) / (r - l)).clamp(0., 1.)
@@ -508,55 +466,19 @@ impl Scene for EndingScene {
             .draw();
 
 
-        // ---- end-of-render diagnostic probe (temporary) ----
-        {
-            // `get_internal_gl` arrives through `use macroquad::prelude::*;`;
-            // `macroquad::graphics` is a private module in this fork.
-            unsafe { get_internal_gl() }.flush();
-            unsafe {
-                use miniquad::gl::*;
-                // Raw values: this miniquad fork's desktop GL constant table is
-                // missing several of these, and a missing name is a hard error.
-                let gl_att_width: u32 = 0x8CE0;
-                let gl_att_height: u32 = 0x8CE1;
-                let n = {
-                    thread_local! {
-                        static N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-                    }
-                    N.with(|c| {
-                        let v = c.get();
-                        c.set(v + 1);
-                        v
-                    })
-                };
-                if n % 60 == 0 {
-                    const GL_FB_BINDING: u32 = 0x8CA6;
-                    const GL_VIEWPORT: u32 = 0x0BA2;
-                    const GL_SCISSOR_BOX: u32 = 0x0C10;
-                    const GL_SCISSOR_TEST: u32 = 0x0C11;
-                    let mut fbo = 0i32;
-                    glGetIntegerv(GL_FB_BINDING, &mut fbo);
-                    let mut aw = 0i32;
-                    let mut ah = 0i32;
-                    glGetFramebufferAttachmentParameteriv(fbo as u32, gl_att_width, 0x8CD0, &mut aw);
-                    glGetFramebufferAttachmentParameteriv(fbo as u32, gl_att_height, 0x8CD0, &mut ah);
-                    let mut vp = [0i32; 4];
-                    glGetIntegerv(GL_VIEWPORT, vp.as_mut_ptr());
-                    let mut sb = [0i32; 4];
-                    glGetIntegerv(GL_SCISSOR_BOX, sb.as_mut_ptr());
-                    let mut st = 0i32;
-                    glGetIntegerv(GL_SCISSOR_TEST, &mut st);
-                    let err = glGetError();
-                    eprintln!(
-                        "[end#{n}] tgt={} fbo={fbo} att={aw}x{ah} vp={vp:?} sb={sb:?} sctest={st} err={err} screen={}x{}",
-                        self.target.is_some(),
-                        screen_width(),
-                        screen_height()
-                    );
-                }
-            }
-        }
-        // ---- end diagnostic probe ----
+        // Submit this frame's draw calls while the camera installed by
+        // `set_camera` above is still the active one.
+        //
+        // `SceneEnding` is an overlay: `Main::render` only draws the last
+        // scene, so nothing in the ending path touches the batch buffer after
+        // this point, yet `Ui::new` had already bound the default framebuffer
+        // and left the GL scissor at the window size. Deferring the flush to
+        // the end of the frame submitted these draws against that stale
+        // binding, which cut the whole result page at 2/3 of the frame width
+        // (1280 px on a 1920x1080 render, and the page slid into the
+        // bottom-left corner on a 2560x1440 render). Flushing here keeps every
+        // draw call on the render target the camera asked for.
+        unsafe { get_internal_gl() }.flush();
 
         Ok(())
     }
