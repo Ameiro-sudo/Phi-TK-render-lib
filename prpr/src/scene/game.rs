@@ -1729,27 +1729,13 @@ impl Scene for GameScene {
         let dt = 0.016_f32;
         self.judgement_bar.update(dt, tm.now());
 
-        //let dt = 0.016_f32;
-        if self.display_score != self.actual_score {
-            let diff = (self.actual_score as i32 - self.display_score as i32) as f32;
-            let diff_magnitude = diff.abs();
-            const SPEED_FACTOR: f32 = 1.0008;
-            let target_speed = diff_magnitude * SPEED_FACTOR;
-            let speed_diff = target_speed - self.current_speed.abs();
-            self.current_speed += speed_diff.signum() * speed_diff.abs() * dt * 5.0;
-            self.current_speed = self.current_speed.max(0.0);
-
-            let step_f = self.current_speed * dt * diff.signum();
-            let step = step_f.abs().ceil() as u32;
-
-            if diff > 0.0 {
-                self.display_score = (self.display_score + step).min(self.actual_score);
-            } else {
-                self.display_score = self.display_score.saturating_sub(step);
-            }
-        } else {
-            self.current_speed = 0.0;
-        }
+        // Upstream springs `display_score` toward `actual_score` with a velocity
+        // proportional to the remaining gap (`SPEED_FACTOR = 1.0008`), which makes
+        // the counter keep ticking for ~4 s after the last note has been hit. In a
+        // replay that reads as a glitch, so snap it instead. `current_speed` is kept
+        // at zero so nothing else that reads it goes off.
+        self.display_score = self.actual_score;
+        self.current_speed = 0.0;
         {
             let chart_ratio = self.current_chart_ratio;
             let base_spacing = 0.1;
