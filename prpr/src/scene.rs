@@ -483,20 +483,6 @@ impl Main {
             return Ok(());
         }
         let mut ui = Ui::new(painter, self.viewport);
-        {
-            use std::cell::Cell;
-            thread_local! { static SD: Cell<u64> = const { Cell::new(0) }; }
-            let n = SD.with(|c| { let v = c.get() + 1; c.set(v); v });
-            if n % 600 == 1 {
-                eprintln!(
-                    "[scene-dbg#{n}] self.viewport={:?} cam.vp={:?} screen={}x{}",
-                    self.viewport,
-                    ui.camera().viewport,
-                    screen_width(),
-                    screen_height()
-                );
-            }
-        }
         ui.set_touches(self.touches.take().unwrap());
         ui.scope(|ui| self.scenes.last_mut().unwrap().render(&mut self.tm, ui))?;
         if self.top_level {
